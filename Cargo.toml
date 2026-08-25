@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "1.5.0"
 edition = "2024"
-repository = "https://github.com/japo0nn/jumabek"
+repository = "https://github.com/jumabek-dev/jumabek"
 
 [package]
 name = "jumabek"

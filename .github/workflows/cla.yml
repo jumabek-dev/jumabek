@@ -28,7 +28,7 @@ jobs:
           # repo to keep in sync and no personal token to leak.
           branch: cla-signatures
           path-to-signatures: signatures/version1/cla.json
-          path-to-document: https://github.com/japo0nn/jumabek/blob/main/CONTRIBUTING.md
+          path-to-document: https://github.com/jumabek-dev/jumabek/blob/main/CONTRIBUTING.md
           custom-notsigned-prcomment: >
             Thanks for the pull request. This project needs a Contributor License
             Agreement before it can merge — it is what keeps the option of adjusting

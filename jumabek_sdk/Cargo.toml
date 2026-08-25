@@ -4,7 +4,7 @@ description = "Types and runtime for writing JumaBek skills"
 version = "1.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/japo0nn/jumabek"
+repository = "https://github.com/jumabek-dev/jumabek"
 
 [dependencies]
 async-trait = "0.1"

@@ -4,7 +4,7 @@ description = "Talk to JumaBek from a phone, through a Telegram bot"
 version = "1.0.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/japo0nn/jumabek"
+repository = "https://github.com/jumabek-dev/jumabek"
 
 [dependencies]
 jumabek_sdk = { path = "../../jumabek_sdk" }

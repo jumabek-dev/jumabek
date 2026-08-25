@@ -2,12 +2,12 @@
 #
 # Installs JumaBek on Linux and macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/japo0nn/jumabek/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.sh | bash
 #   ./install.sh --version v1.0.0 --yes
 #
 set -euo pipefail
 
-REPO="${JUMABEK_REPO:-japo0nn/jumabek}"
+REPO="${JUMABEK_REPO:-jumabek-dev/jumabek}"
 VERSION="latest"
 ASSUME_YES=0
 

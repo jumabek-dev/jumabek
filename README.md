@@ -1,9 +1,9 @@
 <img src="docs/banner.svg" alt="JumaBek" width="100%">
 
 <p>
-  <a href="../../actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/japo0nn/jumabek/ci.yml?branch=main&style=flat-square&label=ci&labelColor=1f2a37&color=a3d977"></a>
-  <a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/japo0nn/jumabek?style=flat-square&label=release&labelColor=1f2a37&color=5ccfe6"></a>
-  <a href="../../releases/latest"><img alt="Downloads" src="https://img.shields.io/github/downloads/japo0nn/jumabek/total?style=flat-square&label=downloads&labelColor=1f2a37&color=f07178"></a>
+  <a href="../../actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/jumabek-dev/jumabek/ci.yml?branch=main&style=flat-square&label=ci&labelColor=1f2a37&color=a3d977"></a>
+  <a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/jumabek-dev/jumabek?style=flat-square&label=release&labelColor=1f2a37&color=5ccfe6"></a>
+  <a href="../../releases/latest"><img alt="Downloads" src="https://img.shields.io/github/downloads/jumabek-dev/jumabek/total?style=flat-square&label=downloads&labelColor=1f2a37&color=f07178"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-windows%20%C2%B7%20linux%20%C2%B7%20macos-c3a6ff?style=flat-square&labelColor=1f2a37">
   <img alt="Rust" src="https://img.shields.io/badge/rust-2024%20edition-ffcc66?style=flat-square&labelColor=1f2a37">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/core-AGPL--3.0-8aa0b8?style=flat-square&labelColor=1f2a37"></a>
@@ -16,7 +16,7 @@ It runs on your machine, does real work on it, and when a task needs something i
 it says so, asks, and compiles the missing piece — each one checked inside a container before
 it is allowed near your files.
 
-[Install](#install) · [How it works](#how-it-works) · [Writing skills](#writing-skills) · [Safety](#safety) · [Limits](#what-it-does-not-do) · [Site](https://japo0nn.github.io/jumabek/)
+[Install](#install) · [How it works](#how-it-works) · [Writing skills](#writing-skills) · [Safety](#safety) · [Limits](#what-it-does-not-do) · [Site](https://jumabek-dev.github.io/jumabek/)
 
 ---
 
@@ -61,14 +61,14 @@ on every later run.
 <tr><td><b>Windows</b></td><td>
 
 ```powershell
-irm https://raw.githubusercontent.com/japo0nn/jumabek/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.ps1 | iex
 ```
 
 </td></tr>
 <tr><td><b>Linux, macOS</b></td><td>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/japo0nn/jumabek/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.sh | bash
 ```
 
 </td></tr>
@@ -81,7 +81,7 @@ of them for you.
 From source, if you would rather:
 
 ```bash
-cargo install --git https://github.com/japo0nn/jumabek
+cargo install --git https://github.com/jumabek-dev/jumabek
 ```
 
 Then set a key and start:

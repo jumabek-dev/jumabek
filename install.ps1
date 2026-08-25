@@ -3,7 +3,7 @@
     Installs JumaBek on Windows.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/japo0nn/jumabek/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.ps1 | iex
 
 .EXAMPLE
     .\install.ps1 -Version v1.0.0 -Yes
@@ -11,7 +11,7 @@
 [CmdletBinding()]
 param(
     [string]$Version = "latest",
-    [string]$Repo = "japo0nn/jumabek",
+    [string]$Repo = "jumabek-dev/jumabek",
     [switch]$Yes
 )
 
