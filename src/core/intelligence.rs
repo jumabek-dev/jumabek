@@ -69,7 +69,9 @@ impl Reason {
             }
             Reason::BuildAttempts => "the skill failed to build more than once",
             Reason::WritingASkill => "writing a skill always runs at the highest level",
-            Reason::Circling => "half the iterations are gone and the task is not finished",
+            Reason::Circling => {
+                "the same step repeated without progress, or the task is nearly out of iterations"
+            }
             Reason::NobodyWatching => "nobody is at the keyboard for this one",
             Reason::TaskFinished => "back to the default level for a new task",
             Reason::ModelAsked => "you asked for it",

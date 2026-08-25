@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::configs::find_file;
+use crate::core::intelligence::Level;
 use crate::error::{JumabekError, JumabekResult};
 
 pub const ENV_API_KEY: &str = "JUMABEK_API_KEY";
@@ -36,6 +37,8 @@ pub fn inbox_tokens() -> std::collections::BTreeMap<String, String> {
 pub struct LlmSecrets {
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub levels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +91,27 @@ pub fn resolve_api_key() -> JumabekResult<String> {
         .unwrap_or_default())
 }
 
+pub fn resolve_api_key_for(level: Level) -> JumabekResult<String> {
+    let env_var = format!("JUMABEK_API_KEY_{}", level.id().to_ascii_uppercase());
+    if let Ok(key) = std::env::var(&env_var) {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
+    let per_level = load()?
+        .and_then(|secrets| secrets.llm.levels.get(level.id()).cloned())
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+
+    if let Some(key) = per_level {
+        return Ok(key);
+    }
+
+    resolve_api_key()
+}
+
 #[cfg(unix)]
 fn warn_if_world_readable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -138,5 +162,15 @@ mod tests {
     fn inbox_tokens_survive_a_file_with_no_llm_section() {
         let secrets = parse("[inbox.tokens]\ntelegram = \"0123456789012345678901234\"\n");
         assert!(secrets.inbox.unwrap().tokens.contains_key("telegram"));
+    }
+
+    #[test]
+    fn a_level_key_is_read_from_its_own_table() {
+        let secrets = parse("[llm.levels]\nmedium = \"ollama-cloud-key\"\n");
+        assert_eq!(
+            secrets.llm.levels.get("medium").map(String::as_str),
+            Some("ollama-cloud-key")
+        );
+        assert!(!secrets.llm.levels.contains_key("low"));
     }
 }

@@ -249,7 +249,10 @@ Some changes are not yours to make and happen anyway:
 
 - writing a skill goes to `high` before the first chunk, always;
 - two unreadable answers in a row, or a build that keeps failing, move you up;
-- a task running out of iterations without finishing moves you up;
+- calling the same skill the same way three turns running moves you up — that is not a long
+  task, that is being stuck;
+- a task nearly out of iterations without finishing moves you up, as a last resort, if nothing
+  else already did;
 - a background job or something that came through the inbox starts at `low`, because there
   is nobody to talk to at three in the morning.
 

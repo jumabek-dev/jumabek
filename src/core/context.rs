@@ -26,6 +26,13 @@ impl ContextBuilder {
         }
     }
 
+    pub fn rescaled(&self, context_token_limit: u32) -> Self {
+        ContextBuilder {
+            system_prompt: self.system_prompt.clone(),
+            budget: context_token_limit as usize * BUDGET_PERCENT / 100,
+        }
+    }
+
     #[cfg(test)]
     pub fn build(
         &self,
@@ -249,6 +256,25 @@ mod tests {
             result.is_err(),
             "an oversized profile was quietly ignored instead of reported"
         );
+    }
+
+    #[test]
+    fn rescaled_changes_the_budget_but_keeps_the_prompt() {
+        let huge = "fact ".repeat(20_000);
+        let narrow = ContextBuilder::new("short", 1_000);
+        assert!(
+            narrow
+                .build_with_profile(&[], &task_object(), &huge)
+                .is_err()
+        );
+
+        let widened = narrow.rescaled(200_000);
+        assert!(
+            widened
+                .build_with_profile(&[], &task_object(), &huge)
+                .is_ok()
+        );
+        assert_eq!(widened.system_prompt, narrow.system_prompt);
     }
 
     #[test]

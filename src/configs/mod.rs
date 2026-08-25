@@ -26,6 +26,8 @@ pub struct Config {
     pub system_prompt_file: PathBuf,
     #[serde(skip)]
     pub api_key: String,
+    #[serde(skip)]
+    pub level_api_keys: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,10 @@ pub struct LlmSection {
     #[serde(default)]
     pub reasoning_effort: String,
     #[serde(default)]
+    pub protocol: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
     pub intelligence: IntelligenceSection,
 }
 
@@ -64,6 +70,24 @@ pub struct IntelligenceSection {
     pub high: String,
     #[serde(default)]
     pub default: String,
+    #[serde(default)]
+    pub endpoints: std::collections::BTreeMap<String, LevelEndpoint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LevelEndpoint {
+    #[serde(default)]
+    pub base_uri: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub structured_output: Option<bool>,
+    #[serde(default)]
+    pub context_token_limit: Option<u32>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 impl IntelligenceSection {
@@ -79,6 +103,10 @@ impl IntelligenceSection {
             Level::Medium => self.medium.trim(),
             Level::High => self.high.trim(),
         }
+    }
+
+    pub fn endpoint(&self, level: Level) -> Option<&LevelEndpoint> {
+        self.endpoints.get(level.id())
     }
 
     pub fn starting_level(&self) -> Level {
@@ -258,6 +286,9 @@ fn default_retry_max_retries() -> u32 {
 fn default_request_timeout() -> u64 {
     180
 }
+fn default_max_tokens() -> u32 {
+    8192
+}
 fn default_retry_initial_delay_ms() -> u64 {
     1000
 }
@@ -334,7 +365,21 @@ impl Config {
         config.system_prompt = load_system_prompt(&config.system_prompt_file)?;
         config.api_key = secrets::resolve_api_key()?;
 
+        for level in Level::ALL {
+            let key = secrets::resolve_api_key_for(level)?;
+            if !key.is_empty() {
+                config.level_api_keys.insert(level.id().to_string(), key);
+            }
+        }
+
         Ok((config, path))
+    }
+
+    pub fn api_key_for(&self, level: Level) -> &str {
+        self.level_api_keys
+            .get(level.id())
+            .map(String::as_str)
+            .unwrap_or(&self.api_key)
     }
 
     pub fn settings_for_skill(&self, name: &str) -> std::collections::BTreeMap<String, String> {
@@ -405,6 +450,7 @@ mod intelligence_tests {
             medium: medium.to_string(),
             high: high.to_string(),
             default: default.to_string(),
+            endpoints: std::collections::BTreeMap::new(),
         }
     }
 
@@ -446,5 +492,51 @@ mod intelligence_tests {
         assert_eq!(odd.starting_level(), Level::Medium);
         assert_eq!(odd.problems().len(), 1);
         assert!(odd.problems()[0].contains("genius"));
+    }
+
+    #[test]
+    fn a_level_without_an_endpoint_override_has_none() {
+        let plain = section("a", "b", "c", "");
+        assert!(plain.endpoint(Level::Low).is_none());
+    }
+
+    #[test]
+    fn a_level_with_an_endpoint_override_is_found_by_its_own_name() {
+        let mut with_endpoint = section("a", "b", "c", "");
+        with_endpoint.endpoints.insert(
+            "low".to_string(),
+            LevelEndpoint {
+                base_uri: Some("http://localhost:11434/v1".to_string()),
+                reasoning_effort: Some("none".to_string()),
+                structured_output: None,
+                context_token_limit: None,
+                protocol: None,
+                max_tokens: None,
+            },
+        );
+
+        let found = with_endpoint.endpoint(Level::Low).expect("low was set");
+        assert_eq!(found.base_uri.as_deref(), Some("http://localhost:11434/v1"));
+        assert!(with_endpoint.endpoint(Level::Medium).is_none());
+    }
+
+    #[test]
+    fn a_level_can_override_protocol_and_max_tokens() {
+        let mut with_endpoint = section("a", "b", "c", "");
+        with_endpoint.endpoints.insert(
+            "high".to_string(),
+            LevelEndpoint {
+                base_uri: None,
+                reasoning_effort: None,
+                structured_output: None,
+                context_token_limit: None,
+                protocol: Some("anthropic".to_string()),
+                max_tokens: Some(16_000),
+            },
+        );
+
+        let found = with_endpoint.endpoint(Level::High).expect("high was set");
+        assert_eq!(found.protocol.as_deref(), Some("anthropic"));
+        assert_eq!(found.max_tokens, Some(16_000));
     }
 }

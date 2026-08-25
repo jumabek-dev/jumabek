@@ -5,20 +5,61 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
 use crate::configs::Config;
 use crate::core::json_repair;
-use crate::core::task::{AgentResponse, LlmMessage};
+use crate::core::task::{AgentResponse, LlmMessage, agent_response_schema};
 use crate::error::{JumabekError, JumabekResult};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_THINKING_BUDGET: u32 = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    OpenAi,
+    Anthropic,
+}
+
+impl Protocol {
+    pub fn parse(raw: &str) -> Option<Protocol> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "openai" => Some(Protocol::OpenAi),
+            "anthropic" | "claude" => Some(Protocol::Anthropic),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
-    endpoint: String,
-    model: String,
-    api_key: String,
     max_retries: u32,
     initial_delay_ms: u64,
-    reasoning_effort: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestTarget {
+    pub protocol: Protocol,
+    pub model: String,
+    pub endpoint: String,
+    pub api_key: String,
+    pub reasoning_effort: String,
+    pub structured_output: bool,
+    pub max_tokens: u32,
+}
+
+impl RequestTarget {
+    pub fn global(config: &Config) -> Self {
+        let protocol = Protocol::parse(&config.llm.protocol).unwrap_or_default();
+        RequestTarget {
+            protocol,
+            model: config.llm.model.clone(),
+            endpoint: chat_endpoint(&config.llm.base_uri, protocol),
+            api_key: config.api_key.clone(),
+            reasoning_effort: config.llm.reasoning_effort.trim().to_string(),
+            structured_output: true,
+            max_tokens: config.llm.max_tokens,
+        }
+    }
 }
 
 pub struct LlmReply {
@@ -36,21 +77,17 @@ impl LlmClient {
 
         Ok(LlmClient {
             http,
-            endpoint: chat_endpoint(&config.llm.base_uri),
-            model: config.llm.model.clone(),
-            api_key: config.api_key.clone(),
             max_retries: config.llm.retry_max_retries.max(1),
             initial_delay_ms: config.llm.retry_initial_delay_ms,
-            reasoning_effort: config.llm.reasoning_effort.trim().to_string(),
         })
     }
 
     pub async fn ask_as(
         &self,
         messages: &[LlmMessage],
-        model: Option<&str>,
+        target: &RequestTarget,
     ) -> JumabekResult<LlmReply> {
-        let content = self.request_content(messages, model).await?;
+        let content = self.request_content(messages, target).await?;
         let response = parse_agent_response(&content)?;
         Ok(LlmReply {
             response,
@@ -58,7 +95,12 @@ impl LlmClient {
         })
     }
 
-    pub async fn complete(&self, system: &str, user: &str) -> JumabekResult<String> {
+    pub async fn complete(
+        &self,
+        system: &str,
+        user: &str,
+        target: &RequestTarget,
+    ) -> JumabekResult<String> {
         let messages = vec![
             LlmMessage {
                 role: "system".to_string(),
@@ -69,29 +111,23 @@ impl LlmClient {
                 content: user.to_string(),
             },
         ];
-        self.request_content(&messages, None).await
+        self.request_content(&messages, target).await
     }
 
     async fn request_content(
         &self,
         messages: &[LlmMessage],
-        model: Option<&str>,
+        target: &RequestTarget,
     ) -> JumabekResult<String> {
-        let mut body = serde_json::json!({
-            "model": model.unwrap_or(&self.model),
-            "messages": messages,
-            "stream": false,
-            "thinking": { "type": "disabled" }
-        });
-
-        if !self.reasoning_effort.is_empty() {
-            body["reasoning_effort"] = serde_json::Value::String(self.reasoning_effort.clone());
-        }
+        let body = match target.protocol {
+            Protocol::OpenAi => build_openai_body(messages, target),
+            Protocol::Anthropic => build_anthropic_body(messages, target),
+        };
 
         let mut last_error = JumabekError::LlmUnavailable("no attempt was made".to_string());
 
         for attempt in 0..self.max_retries {
-            match self.attempt(&body).await {
+            match self.attempt(&body, target).await {
                 Ok(content) => return Ok(content),
                 Err(AttemptError::Fatal(e)) => return Err(e),
                 Err(AttemptError::Retryable(e)) => last_error = e,
@@ -106,15 +142,35 @@ impl LlmClient {
         Err(last_error)
     }
 
-    async fn attempt(&self, body: &serde_json::Value) -> Result<String, AttemptError> {
+    async fn attempt(
+        &self,
+        body: &serde_json::Value,
+        target: &RequestTarget,
+    ) -> Result<String, AttemptError> {
         let mut request = self
             .http
-            .post(&self.endpoint)
+            .post(&target.endpoint)
             .header(CONTENT_TYPE, "application/json");
 
-        if !self.api_key.is_empty() {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", self.api_key));
-        }
+        request = match target.protocol {
+            Protocol::OpenAi => {
+                if target.api_key.is_empty() {
+                    request
+                } else {
+                    request.header(AUTHORIZATION, format!("Bearer {}", target.api_key))
+                }
+            }
+            Protocol::Anthropic => {
+                let key = if target.api_key.is_empty() {
+                    "ollama"
+                } else {
+                    target.api_key.as_str()
+                };
+                request
+                    .header("x-api-key", key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            }
+        };
 
         let response = request.json(body).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -123,7 +179,7 @@ impl LlmClient {
                 AttemptError::Retryable(JumabekError::LlmUnavailable(format!(
                     "{} — nothing is answering at {}. Check that the endpoint is running \
                          and that [llm].base_uri points at it.",
-                    e, self.endpoint
+                    e, target.endpoint
                 )))
             }
         })?;
@@ -140,8 +196,74 @@ impl LlmClient {
             return Err(classify_status(status, &text));
         }
 
-        extract_content(&text).map_err(AttemptError::Fatal)
+        extract_content(&text, target.protocol).map_err(AttemptError::Fatal)
     }
+}
+
+fn build_openai_body(messages: &[LlmMessage], target: &RequestTarget) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": target.model,
+        "messages": messages,
+        "stream": false,
+    });
+
+    if !target.reasoning_effort.is_empty() {
+        body["reasoning_effort"] = serde_json::Value::String(target.reasoning_effort.clone());
+    }
+
+    if target.structured_output {
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "agent_response",
+                "schema": agent_response_schema(),
+                "strict": true
+            }
+        });
+    }
+
+    body
+}
+
+fn build_anthropic_body(messages: &[LlmMessage], target: &RequestTarget) -> serde_json::Value {
+    let system: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.as_str())
+        .collect();
+    let rest: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
+
+    let mut body = serde_json::json!({
+        "model": target.model,
+        "messages": rest,
+        "max_tokens": target.max_tokens,
+        "stream": false,
+    });
+
+    if !system.is_empty() {
+        body["system"] = serde_json::Value::String(system.join("\n\n"));
+    }
+
+    match target.reasoning_effort.as_str() {
+        "" => {}
+        "none" => body["thinking"] = serde_json::json!({ "type": "disabled" }),
+        _ => {
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": ANTHROPIC_THINKING_BUDGET
+            })
+        }
+    }
+
+    if target.structured_output {
+        body["tools"] = serde_json::json!([{
+            "name": "agent_response",
+            "input_schema": agent_response_schema()
+        }]);
+        body["tool_choice"] = serde_json::json!({ "type": "tool", "name": "agent_response" });
+    }
+
+    body
 }
 
 enum AttemptError {
@@ -150,16 +272,21 @@ enum AttemptError {
 }
 
 fn api_root(base_uri: &str) -> String {
-    let base = base_uri
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches("/chat/completions");
+    let mut base = base_uri.trim().trim_end_matches('/');
+
+    for suffix in ["/chat/completions", "/messages", "/api/chat", "/chat"] {
+        base = base.trim_end_matches(suffix);
+    }
 
     format!("{}/v1", base.trim_end_matches("/v1"))
 }
 
-fn chat_endpoint(base_uri: &str) -> String {
-    format!("{}/chat/completions", api_root(base_uri))
+pub fn chat_endpoint(base_uri: &str, protocol: Protocol) -> String {
+    let root = api_root(base_uri);
+    match protocol {
+        Protocol::OpenAi => format!("{}/chat/completions", root),
+        Protocol::Anthropic => format!("{}/messages", root),
+    }
 }
 
 pub fn models_endpoint(base_uri: &str) -> String {
@@ -219,7 +346,7 @@ fn summarise_error_body(body: &str) -> String {
     trimmed.chars().take(300).collect()
 }
 
-fn extract_content(body: &str) -> JumabekResult<String> {
+fn extract_content(body: &str, protocol: Protocol) -> JumabekResult<String> {
     let raw: serde_json::Value = serde_json::from_str(body).map_err(|e| {
         JumabekError::LlmInvalidResponse(format!(
             "provider returned non-JSON: {} — body starts with: {}",
@@ -228,6 +355,13 @@ fn extract_content(body: &str) -> JumabekResult<String> {
         ))
     })?;
 
+    match protocol {
+        Protocol::OpenAi => extract_openai_content(&raw, body),
+        Protocol::Anthropic => extract_anthropic_content(&raw, body),
+    }
+}
+
+fn extract_openai_content(raw: &serde_json::Value, body: &str) -> JumabekResult<String> {
     let choices = raw.get("choices").and_then(|c| c.as_array());
     let Some(choices) = choices else {
         return Err(JumabekError::LlmInvalidResponse(format!(
@@ -262,6 +396,50 @@ fn extract_content(body: &str) -> JumabekResult<String> {
     Ok(content.to_string())
 }
 
+fn extract_anthropic_content(raw: &serde_json::Value, body: &str) -> JumabekResult<String> {
+    let blocks = raw.get("content").and_then(|c| c.as_array());
+    let Some(blocks) = blocks else {
+        return Err(JumabekError::LlmInvalidResponse(format!(
+            "response has no 'content' array: {}",
+            body.chars().take(300).collect::<String>()
+        )));
+    };
+
+    let tool_use = blocks
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+
+    if let Some(block) = tool_use {
+        let input = block
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return serde_json::to_string(&input).map_err(|e| {
+            JumabekError::LlmInvalidResponse(format!("cannot encode tool_use input: {}", e))
+        });
+    }
+
+    let text = blocks
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+
+    if text.trim().is_empty() {
+        let stop_reason = raw
+            .get("stop_reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown");
+        return Err(JumabekError::LlmInvalidResponse(format!(
+            "model returned empty content (stop_reason: {})",
+            stop_reason
+        )));
+    }
+
+    Ok(text.to_string())
+}
+
 pub fn parse_agent_response(content: &str) -> JumabekResult<AgentResponse> {
     let payload = json_repair::extract_json_payload(content);
 
@@ -287,27 +465,51 @@ mod tests {
     use crate::core::task::ActionType;
 
     #[test]
-    fn every_way_a_server_documents_its_address_lands_on_one_endpoint() {
+    fn every_way_a_server_documents_its_address_lands_on_one_openai_endpoint() {
         assert_eq!(
-            chat_endpoint("http://localhost:20128/api"),
+            chat_endpoint("http://localhost:20128/api", Protocol::OpenAi),
             "http://localhost:20128/api/v1/chat/completions"
         );
         assert_eq!(
-            chat_endpoint("http://localhost:11434/v1"),
+            chat_endpoint("http://localhost:11434/v1", Protocol::OpenAi),
             "http://localhost:11434/v1/chat/completions"
         );
         assert_eq!(
-            chat_endpoint("http://localhost:1234/v1/"),
+            chat_endpoint("http://localhost:1234/v1/", Protocol::OpenAi),
             "http://localhost:1234/v1/chat/completions"
         );
         assert_eq!(
-            chat_endpoint("http://localhost:11434"),
+            chat_endpoint("http://localhost:11434", Protocol::OpenAi),
             "http://localhost:11434/v1/chat/completions"
         );
         assert_eq!(
-            chat_endpoint("https://api.example.com/v1/chat/completions"),
+            chat_endpoint(
+                "https://api.example.com/v1/chat/completions",
+                Protocol::OpenAi
+            ),
             "https://api.example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn anthropic_protocol_lands_on_the_messages_endpoint() {
+        assert_eq!(
+            chat_endpoint("http://localhost:11434", Protocol::Anthropic),
+            "http://localhost:11434/v1/messages"
+        );
+        assert_eq!(
+            chat_endpoint("http://localhost:11434/v1/messages", Protocol::Anthropic),
+            "http://localhost:11434/v1/messages"
+        );
+    }
+
+    #[test]
+    fn protocol_parses_the_names_a_config_might_use() {
+        assert_eq!(Protocol::parse(""), Some(Protocol::OpenAi));
+        assert_eq!(Protocol::parse("openai"), Some(Protocol::OpenAi));
+        assert_eq!(Protocol::parse("Anthropic"), Some(Protocol::Anthropic));
+        assert_eq!(Protocol::parse("claude"), Some(Protocol::Anthropic));
+        assert_eq!(Protocol::parse("ollama-native"), None);
     }
 
     #[test]
@@ -318,7 +520,7 @@ mod tests {
             "http://localhost:11434",
             "https://api.example.com/v1/chat/completions",
         ] {
-            let chat = chat_endpoint(base);
+            let chat = chat_endpoint(base, Protocol::OpenAi);
             let models = models_endpoint(base);
 
             assert_eq!(
@@ -339,13 +541,17 @@ mod tests {
     #[test]
     fn reads_content_out_of_envelope() {
         let body = body_with(r#"{"message":"ok","is_done":true,"actions":[]}"#);
-        assert!(extract_content(&body).unwrap().contains("\"ok\""));
+        assert!(
+            extract_content(&body, Protocol::OpenAi)
+                .unwrap()
+                .contains("\"ok\"")
+        );
     }
 
     #[test]
     fn rejects_error_envelope_instead_of_returning_empty() {
         let body = r#"{"error":{"message":"invalid api key","type":"auth_error"}}"#;
-        let err = extract_content(body).unwrap_err();
+        let err = extract_content(body, Protocol::OpenAi).unwrap_err();
         assert!(matches!(err, JumabekError::LlmInvalidResponse(_)));
     }
 
@@ -355,8 +561,91 @@ mod tests {
             "choices": [{ "message": { "content": "" }, "finish_reason": "length" }]
         })
         .to_string();
-        let err = extract_content(&body).unwrap_err().to_string();
+        let err = extract_content(&body, Protocol::OpenAi)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("length"), "got: {err}");
+    }
+
+    #[test]
+    fn anthropic_content_prefers_a_tool_use_block() {
+        let body = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "ignored" },
+                { "type": "tool_use", "name": "agent_response", "input": {"message": "hi", "is_done": true, "actions": []} }
+            ]
+        })
+        .to_string();
+        let content = extract_content(&body, Protocol::Anthropic).unwrap();
+        assert!(content.contains("\"is_done\":true"));
+    }
+
+    #[test]
+    fn anthropic_content_falls_back_to_a_text_block() {
+        let body = serde_json::json!({
+            "content": [{ "type": "text", "text": "{\"message\":\"hi\"}" }]
+        })
+        .to_string();
+        assert_eq!(
+            extract_content(&body, Protocol::Anthropic).unwrap(),
+            r#"{"message":"hi"}"#
+        );
+    }
+
+    #[test]
+    fn anthropic_reports_empty_content_with_stop_reason() {
+        let body = serde_json::json!({
+            "content": [{ "type": "text", "text": "" }],
+            "stop_reason": "max_tokens"
+        })
+        .to_string();
+        let err = extract_content(&body, Protocol::Anthropic)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_tokens"), "got: {err}");
+    }
+
+    fn target(protocol: Protocol) -> RequestTarget {
+        RequestTarget {
+            protocol,
+            model: "test-model".to_string(),
+            endpoint: "http://localhost/x".to_string(),
+            api_key: String::new(),
+            reasoning_effort: String::new(),
+            structured_output: false,
+            max_tokens: 8192,
+        }
+    }
+
+    #[test]
+    fn anthropic_body_moves_system_out_of_messages_and_always_sets_max_tokens() {
+        let messages = vec![
+            LlmMessage {
+                role: "system".to_string(),
+                content: "you are jumabek".to_string(),
+            },
+            LlmMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+        ];
+
+        let body = build_anthropic_body(&messages, &target(Protocol::Anthropic));
+
+        assert_eq!(body["system"], "you are jumabek");
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn anthropic_structured_output_forces_the_agent_response_tool() {
+        let mut t = target(Protocol::Anthropic);
+        t.structured_output = true;
+        let body = build_anthropic_body(&[], &t);
+
+        assert_eq!(body["tool_choice"]["name"], "agent_response");
+        assert_eq!(body["tools"][0]["name"], "agent_response");
     }
 
     #[test]

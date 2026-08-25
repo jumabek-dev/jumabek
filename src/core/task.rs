@@ -290,3 +290,252 @@ pub struct LlmMessage {
     pub role: String,
     pub content: String,
 }
+
+pub fn agent_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "message": { "type": "string" },
+            "is_done": { "type": "boolean" },
+            "actions": { "type": "array", "items": { "oneOf": action_type_schemas() } }
+        },
+        "required": ["message", "is_done", "actions"]
+    })
+}
+
+fn action_type_schemas() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "ExecuteModule" },
+                "module": { "type": "string" },
+                "method": { "type": "string" },
+                "args": { "type": "string" },
+                "parallel": { "type": "boolean" }
+            },
+            "required": ["type", "module", "method", "args"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": { "type": { "const": "RespondToUser" } },
+            "required": ["type"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "PermissionRequest" },
+                "action": { "type": "string" },
+                "description": { "type": "string" },
+                "risk_level": { "type": "string" }
+            },
+            "required": ["type", "action", "description", "risk_level"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "PromptToUser" },
+                "message": { "type": "string" },
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "value": { "type": "string" }
+                        },
+                        "required": ["label", "value"]
+                    }
+                }
+            },
+            "required": ["type", "message"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "RequestData" },
+                "source": { "type": "string" },
+                "query": { "type": "string" },
+                "limit": { "type": "integer" }
+            },
+            "required": ["type", "source", "query"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "RequestInboxKey" },
+                "module": { "type": "string" },
+                "why": { "type": "string" },
+                "skills": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["type", "module", "why"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "Remember" },
+                "subject": { "type": "string" },
+                "key": { "type": "string" },
+                "value": { "type": "string" },
+                "note": { "type": "string" }
+            },
+            "required": ["type", "subject", "key", "value"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "Forget" },
+                "subject": { "type": "string" },
+                "key": { "type": "string" }
+            },
+            "required": ["type", "subject"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "ScheduleJob" },
+                "name": { "type": "string" },
+                "task": { "type": "string" },
+                "schedule": { "type": "string" },
+                "grant": {
+                    "type": "object",
+                    "properties": {
+                        "skills": { "type": "array", "items": { "type": "string" } },
+                        "new_skills": { "type": "boolean" },
+                        "risky": { "type": "boolean" }
+                    }
+                }
+            },
+            "required": ["type", "name", "task", "schedule"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "ManageJobs" },
+                "operation": { "type": "string" },
+                "id": { "type": "integer" }
+            },
+            "required": ["type", "operation"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "Switch" },
+                "level": { "type": "string" },
+                "why": { "type": "string" }
+            },
+            "required": ["type", "level"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "SpawnAgent" },
+                "task": { "type": "string" },
+                "reason": { "type": "string" }
+            },
+            "required": ["type", "task"]
+        }),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "GenerateChunk" },
+                "module_name": { "type": "string" },
+                "chunk_index": { "type": "integer" },
+                "total_chunks": { "type": "integer" },
+                "code_chunk": { "type": "string" },
+                "dependencies": { "type": "array", "items": { "type": "string" } },
+                "language": { "type": "string" }
+            },
+            "required": ["type", "module_name", "chunk_index", "total_chunks"]
+        }),
+    ]
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    const CANONICAL_TYPES: [&str; 13] = [
+        "ExecuteModule",
+        "RespondToUser",
+        "PermissionRequest",
+        "PromptToUser",
+        "RequestData",
+        "RequestInboxKey",
+        "Remember",
+        "Forget",
+        "ScheduleJob",
+        "ManageJobs",
+        "Switch",
+        "SpawnAgent",
+        "GenerateChunk",
+    ];
+
+    #[test]
+    fn every_canonical_action_type_has_exactly_one_schema_entry() {
+        let schemas = action_type_schemas();
+        assert_eq!(schemas.len(), CANONICAL_TYPES.len());
+
+        let named: Vec<&str> = schemas
+            .iter()
+            .map(|schema| {
+                schema["properties"]["type"]["const"]
+                    .as_str()
+                    .expect("every schema entry names its type")
+            })
+            .collect();
+
+        for wanted in CANONICAL_TYPES {
+            assert_eq!(
+                named.iter().filter(|&&n| n == wanted).count(),
+                1,
+                "{wanted} should have exactly one schema entry"
+            );
+        }
+    }
+
+    #[test]
+    fn every_schema_entry_requires_its_own_type_tag() {
+        for schema in action_type_schemas() {
+            let required = schema["required"]
+                .as_array()
+                .expect("every schema entry lists required fields");
+            assert!(
+                required.iter().any(|v| v == "type"),
+                "{schema} does not require its own type tag"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_payloads_meeting_the_schemas_required_fields_parse() {
+        let samples = [
+            r#"{"type":"ExecuteModule","module":"shell_executor","method":"run","args":"ls"}"#,
+            r#"{"type":"RespondToUser"}"#,
+            r#"{"type":"Switch","level":"high"}"#,
+            r#"{"type":"Remember","subject":"asiya","key":"likes","value":"tea"}"#,
+        ];
+
+        for sample in samples {
+            let action: ActionType =
+                serde_json::from_str(sample).unwrap_or_else(|e| panic!("{sample}: {e}"));
+            let tag = serde_json::to_value(&action).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                CANONICAL_TYPES.contains(&tag.as_str()),
+                "{sample} round-tripped to an unlisted type {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_response_schema_names_all_three_top_level_fields() {
+        let schema = agent_response_schema();
+        let required = schema["required"].as_array().unwrap();
+        for field in ["message", "is_done", "actions"] {
+            assert!(required.iter().any(|v| v == field), "missing {field}");
+        }
+    }
+}

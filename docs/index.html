@@ -1616,8 +1616,8 @@ api_key = <span class="st">"..."</span>       <span class="f">→</span>  <span 
         <p>
           The client sends <code>model</code>, <code>messages</code> and
           <code>stream</code>, and reads <code>choices[0].message.content</code>. That much has
-          been checked against a router and against Ollama, key or no key. What a small local
-          model does not get you for free is the agent itself: every turn has to come back as
+          been checked against Ollama, Ollama Cloud and OmniRoute, key or no key. What a small
+          local model does not get you for free is the agent itself: every turn has to come back as
           one JSON object in a fixed action format, and a 4B model will miss it often. Local is
           a real option for routine work — treat "it connects" and "it can drive the loop" as
           separate questions.

@@ -4,8 +4,8 @@
 db_path = "~/.jumabek/jumabek.db"
 
 [llm]
-model = "cc/claude-sonnet-4-6"
-base_uri = "http://localhost:20128/api"
+model = "gpt-oss:20b"
+base_uri = "http://localhost:11434"
 system_prompt_path = "./prompt.md"
 context_token_limit = 200000
 retry_max_retries = 3
@@ -18,16 +18,58 @@ retry_initial_delay_ms = 1000
 # because a model on CPU can spend minutes on one turn.
 #
 # model = "qwen3.5:4b"
-# base_uri = "http://192.168.60.41:11434/v1"
+# base_uri = "http://localhost:11434"
 # context_token_limit = 16000
 # reasoning_effort = "none"
 # request_timeout_sec = 900
 
 [llm.intelligence]
-low = "cc/claude-haiku-4-5-20251001"
-medium = "cc/claude-sonnet-4-6"
-high = "cc/claude-opus-4-8"
+low = "gpt-oss:20b-cloud"
+medium = "gpt-oss:120b-cloud"
+high = "nemotron-3-ultra:cloud"
 default = "low"
+
+# Ollama Cloud free tier, ranked by usage level (how fast a model burns the
+# weekly quota — roughly its active-parameter count, not its total size).
+# Local Ollama proxies to the cloud account it's signed into (`ollama signin`)
+# when the model name carries a `-cloud` tag — `-cloud` appended to an
+# existing size tag (gpt-oss:20b-cloud), or `:cloud` when there is no size
+# tag of its own (nemotron-3-ultra:cloud). Plain names 404 — confirmed live
+# against this machine's Ollama.
+#   gpt-oss:20b-cloud            ~3.6B active   level 1 — cheapest
+#   nemotron-3-nano:30b-cloud    hybrid MoE     level ~1 — same tier, tool-use tuned
+#   gpt-oss:120b-cloud           ~5.1B active   level ~2 — best power-per-quota jump
+#   gemma4:31b-cloud             31B dense      level ~2-3 — dense costs more per
+#                                                token than its size suggests
+#   nemotron-3-super:cloud       12B active     level ~3 — stronger reasoning, pricier
+#   minimax-m3:cloud             large MoE      level ~3-4 — flagship, specs unverified
+#   nemotron-3-ultra:cloud       55B active     level 4 — heaviest, used sparingly
+#                                                here since it is only escalated to
+# `protocol` picks the wire shape this level's endpoint actually speaks —
+# "openai" (default, /v1/chat/completions) or "anthropic" (/v1/messages,
+# x-api-key header, system separated from messages, max_tokens required).
+# Ollama serves both under the same address; this is the one already proven
+# reachable by `jumabek doctor` this session.
+[llm.intelligence.endpoints.low]
+base_uri = "http://localhost:11434"
+context_token_limit = 128000
+protocol = "openai"
+
+[llm.intelligence.endpoints.medium]
+base_uri = "http://localhost:11434"
+context_token_limit = 128000
+protocol = "openai"
+
+[llm.intelligence.endpoints.high]
+base_uri = "http://localhost:11434"
+context_token_limit = 256000
+protocol = "openai"
+# protocol = "anthropic"   # switch to try the Anthropic-compatible surface instead
+
+# Swap any of the three above for one of these, same endpoint:
+# low    = "nemotron-3-nano:30b-cloud"
+# medium = "gemma4:31b-cloud"
+# high   = "nemotron-3-super:cloud"  or  "minimax-m3:cloud"
 
 [agent]
 max_iterations = 10

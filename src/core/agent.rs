@@ -6,7 +6,7 @@ use crate::core::context::ContextBuilder;
 use crate::core::intelligence::{Level, Reason, Standing};
 use crate::core::jobs::{JobStore, NewJob, Schedule, State};
 use crate::core::languages::Language;
-use crate::core::llm::LlmClient;
+use crate::core::llm::{LlmClient, RequestTarget};
 use crate::core::planner;
 use crate::core::profile;
 use crate::core::safety;
@@ -52,6 +52,37 @@ const CAPABILITIES: [&str; 13] = [
 
 const MAX_DEPTH: u32 = 2;
 
+const CIRCLING_REPEATS: usize = 3;
+
+const CIRCLING_FALLBACK_PERCENT: u32 = 85;
+
+fn execute_fingerprint(response: &AgentResponse) -> Option<String> {
+    let mut calls: Vec<String> = response
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            ActionType::ExecuteModule {
+                module,
+                method,
+                args,
+                ..
+            } => Some(format!("{module}::{method}::{args}")),
+            _ => None,
+        })
+        .collect();
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    calls.sort();
+    Some(calls.join("\n"))
+}
+
+fn is_circling(recent: &std::collections::VecDeque<String>) -> bool {
+    recent.len() >= CIRCLING_REPEATS && recent.iter().all(|call| call == &recent[0])
+}
+
 fn methods_size(skill: &dyn SkillModule) -> usize {
     skill
         .available_methods()
@@ -88,6 +119,44 @@ fn model_for(config: &Config, level: Level) -> String {
         config.llm.model.clone()
     } else {
         named.to_string()
+    }
+}
+
+fn context_limit_for(config: &Config, level: Level) -> u32 {
+    config
+        .llm
+        .intelligence
+        .endpoint(level)
+        .and_then(|e| e.context_token_limit)
+        .unwrap_or(config.llm.context_token_limit)
+}
+
+fn target_for(config: &Config, level: Level) -> RequestTarget {
+    let overrides = config.llm.intelligence.endpoint(level);
+
+    let base_uri = overrides
+        .and_then(|e| e.base_uri.as_deref())
+        .unwrap_or(&config.llm.base_uri);
+    let reasoning_effort = overrides
+        .and_then(|e| e.reasoning_effort.as_deref())
+        .unwrap_or(&config.llm.reasoning_effort);
+    let structured_output = overrides.and_then(|e| e.structured_output).unwrap_or(true);
+    let protocol_raw = overrides
+        .and_then(|e| e.protocol.as_deref())
+        .unwrap_or(&config.llm.protocol);
+    let protocol = crate::core::llm::Protocol::parse(protocol_raw).unwrap_or_default();
+    let max_tokens = overrides
+        .and_then(|e| e.max_tokens)
+        .unwrap_or(config.llm.max_tokens);
+
+    RequestTarget {
+        protocol,
+        model: model_for(config, level),
+        endpoint: crate::core::llm::chat_endpoint(base_uri, protocol),
+        api_key: config.api_key_for(level).to_string(),
+        reasoning_effort: reasoning_effort.trim().to_string(),
+        structured_output,
+        max_tokens,
     }
 }
 
@@ -418,6 +487,8 @@ impl Agent {
         let step = self.config.read().await.agent.max_iterations;
         let mut budget = step;
         let mut last_message = String::new();
+        let mut recent_calls: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
 
         if task.depth == 0 {
             self.reset_level(&task).await;
@@ -428,12 +499,11 @@ impl Agent {
 
             let history = self.history_for(&task).await?;
             let profile = self.profile_block().await;
+            let level = self.level().await;
             let (context, token_limit) = {
                 let config = self.config.read().await;
-                (
-                    self.context.read().await.clone(),
-                    config.llm.context_token_limit,
-                )
+                let limit = context_limit_for(&config, level);
+                (self.context.read().await.rescaled(limit), limit)
             };
             let built = context.build_with_profile(&history, &task, &profile)?;
 
@@ -474,7 +544,26 @@ impl Agent {
                     return Ok(reason);
                 }
                 StepOutcome::Continue(system_response) => {
-                    if task.iteration * 2 >= budget && task.iteration + 1 < budget {
+                    let mut escalated = false;
+
+                    if let Some(fingerprint) = execute_fingerprint(&reply.response) {
+                        recent_calls.push_back(fingerprint);
+                        if recent_calls.len() > CIRCLING_REPEATS {
+                            recent_calls.pop_front();
+                        }
+                        if is_circling(&recent_calls) {
+                            self.escalate(ui, Reason::Circling).await?;
+                            recent_calls.clear();
+                            escalated = true;
+                        }
+                    } else {
+                        recent_calls.clear();
+                    }
+
+                    if !escalated
+                        && task.iteration * 100 >= budget * CIRCLING_FALLBACK_PERCENT
+                        && task.iteration + 1 < budget
+                    {
                         self.escalate(ui, Reason::Circling).await?;
                     }
 
@@ -586,15 +675,8 @@ impl Agent {
                 });
             }
 
-            let model = self.current_model().await;
-            match self
-                .llm
-                .read()
-                .await
-                .clone()
-                .ask_as(&sent, model.as_deref())
-                .await
-            {
+            let target = target_for(&*self.config.read().await, self.level().await);
+            match self.llm.read().await.clone().ask_as(&sent, &target).await {
                 Ok(reply) => return Ok(reply),
                 Err(JumabekError::ParseError(detail)) if attempt < PARSE_RETRIES => {
                     attempt += 1;
@@ -1528,7 +1610,8 @@ impl Agent {
         let system = "You expand search queries for a keyword index. Answer with 5 to 12 words only: synonyms and near-synonyms of the query, in the same language as the query plus their English equivalents. Separate them with spaces. No punctuation, no explanation, no quotes.";
 
         let llm = self.llm.read().await.clone();
-        let widened = llm.complete(system, query).await.ok()?;
+        let target = RequestTarget::global(&*self.config.read().await);
+        let widened = llm.complete(system, query, &target).await.ok()?;
         let cleaned = clean_expansion(&widened);
 
         if cleaned.is_empty() {
@@ -2220,5 +2303,76 @@ mod expansion_tests {
             .sum();
 
         assert!(spent <= SKILL_METHOD_BUDGET, "sent {spent} chars uninvited");
+    }
+
+    fn execute(module: &str, method: &str, args: &str) -> ActionType {
+        ActionType::ExecuteModule {
+            module: module.to_string(),
+            method: method.to_string(),
+            args: args.to_string(),
+            parallel: false,
+        }
+    }
+
+    fn response_with(actions: Vec<ActionType>) -> AgentResponse {
+        AgentResponse {
+            message: String::new(),
+            is_done: false,
+            actions,
+        }
+    }
+
+    #[test]
+    fn a_plain_answer_has_no_fingerprint() {
+        assert!(execute_fingerprint(&response_with(vec![ActionType::RespondToUser])).is_none());
+        assert!(execute_fingerprint(&response_with(Vec::new())).is_none());
+    }
+
+    #[test]
+    fn identical_calls_fingerprint_the_same_regardless_of_order() {
+        let a = response_with(vec![
+            execute("shell_executor", "run", "ls"),
+            execute("weather", "today", "Almaty"),
+        ]);
+        let b = response_with(vec![
+            execute("weather", "today", "Almaty"),
+            execute("shell_executor", "run", "ls"),
+        ]);
+
+        assert_eq!(execute_fingerprint(&a), execute_fingerprint(&b));
+    }
+
+    #[test]
+    fn a_different_call_changes_the_fingerprint() {
+        let a = response_with(vec![execute("shell_executor", "run", "ls")]);
+        let b = response_with(vec![execute("shell_executor", "run", "pwd")]);
+
+        assert_ne!(execute_fingerprint(&a), execute_fingerprint(&b));
+    }
+
+    #[test]
+    fn three_identical_turns_are_circling() {
+        let mut recent = std::collections::VecDeque::new();
+        recent.push_back("shell_executor::run::ls".to_string());
+        recent.push_back("shell_executor::run::ls".to_string());
+        assert!(!is_circling(&recent), "two repeats is not yet circling");
+
+        recent.push_back("shell_executor::run::ls".to_string());
+        assert!(
+            is_circling(&recent),
+            "three identical turns should be circling"
+        );
+    }
+
+    #[test]
+    fn three_different_turns_are_not_circling() {
+        let mut recent = std::collections::VecDeque::new();
+        recent.push_back("a".to_string());
+        recent.push_back("b".to_string());
+        recent.push_back("c".to_string());
+        assert!(
+            !is_circling(&recent),
+            "different steps were mistaken for being stuck"
+        );
     }
 }

@@ -111,7 +111,7 @@ pub async fn run() -> JumabekResult<Vec<Check>> {
         }
     };
 
-    checks.push(check_llm(config.as_ref()).await);
+    checks.extend(check_llm(config.as_ref()).await);
     if let Some(config) = config.as_ref() {
         checks.push(check_intelligence(config));
     }
@@ -144,7 +144,28 @@ fn check_api_key(config: &Config) -> Check {
 
 fn check_intelligence(config: &Config) -> Check {
     let levels = &config.llm.intelligence;
-    let problems = levels.problems();
+    let mut problems = levels.problems();
+
+    if !config.llm.protocol.trim().is_empty()
+        && crate::core::llm::Protocol::parse(&config.llm.protocol).is_none()
+    {
+        problems.push(format!(
+            "[llm] protocol = '{}' is not 'openai' or 'anthropic'",
+            config.llm.protocol.trim()
+        ));
+    }
+
+    for level in crate::core::intelligence::Level::ALL {
+        if let Some(raw) = levels.endpoint(level).and_then(|e| e.protocol.as_deref())
+            && crate::core::llm::Protocol::parse(raw).is_none()
+        {
+            problems.push(format!(
+                "[llm.intelligence.endpoints.{}] protocol = '{}' is not 'openai' or 'anthropic'",
+                level.id(),
+                raw.trim()
+            ));
+        }
+    }
 
     if !problems.is_empty() {
         return Check::new(Level::Warn, "intelligence", problems.join("; ")).with_hint(
@@ -176,69 +197,124 @@ fn check_intelligence(config: &Config) -> Check {
     )
 }
 
-fn models_in_use(config: &Config) -> Vec<String> {
-    let levels = &config.llm.intelligence;
-
-    if !levels.enabled() {
-        return vec![config.llm.model.clone()];
-    }
-
-    let mut names: Vec<String> = Vec::new();
-    for level in crate::core::intelligence::Level::ALL {
-        let model = levels.model(level).to_string();
-        if !names.contains(&model) {
-            names.push(model);
-        }
-    }
-    names
+struct LlmProbe {
+    label: String,
+    base_uri: String,
+    api_key: String,
+    protocol: crate::core::llm::Protocol,
+    models: Vec<String>,
 }
 
-async fn check_llm(config: Option<&Config>) -> Check {
-    let Some(config) = config else {
-        return Check::new(Level::Warn, "LLM", "not checked — no usable config")
-            .with_hint("fix the config first, then run jumabek doctor again");
-    };
+fn llm_probes(config: &Config) -> Vec<LlmProbe> {
+    let global_protocol =
+        crate::core::llm::Protocol::parse(&config.llm.protocol).unwrap_or_default();
 
-    let endpoint = crate::core::llm::models_endpoint(&config.llm.base_uri);
-    let hint = "point [llm].base_uri at any OpenAI-compatible endpoint: a local runner such\n\
-                as Ollama or LM Studio, a router in front of several providers, or a\n\
-                provider directly. An endpoint that wants no API key needs none.";
+    let mut probes = vec![LlmProbe {
+        label: "LLM".to_string(),
+        base_uri: config.llm.base_uri.clone(),
+        api_key: config.api_key.clone(),
+        protocol: global_protocol,
+        models: vec![config.llm.model.clone()],
+    }];
+
+    if !config.llm.intelligence.enabled() {
+        return probes;
+    }
+
+    for level in crate::core::intelligence::Level::ALL {
+        let overrides = config.llm.intelligence.endpoint(level);
+        let model = config.llm.intelligence.model(level).to_string();
+        let base_uri = overrides
+            .and_then(|e| e.base_uri.clone())
+            .unwrap_or_else(|| config.llm.base_uri.clone());
+        let api_key = config.api_key_for(level).to_string();
+        let protocol = overrides
+            .and_then(|e| e.protocol.as_deref())
+            .and_then(crate::core::llm::Protocol::parse)
+            .unwrap_or(global_protocol);
+
+        match probes.iter_mut().find(|p| {
+            p.base_uri.trim_end_matches('/') == base_uri.trim_end_matches('/')
+                && p.api_key == api_key
+                && p.protocol == protocol
+        }) {
+            Some(existing) => {
+                if !existing.models.contains(&model) {
+                    existing.models.push(model);
+                }
+            }
+            None => probes.push(LlmProbe {
+                label: format!("LLM {}", level.id()),
+                base_uri,
+                api_key,
+                protocol,
+                models: vec![model],
+            }),
+        }
+    }
+
+    probes
+}
+
+async fn check_llm(config: Option<&Config>) -> Vec<Check> {
+    let Some(config) = config else {
+        return vec![
+            Check::new(Level::Warn, "LLM", "not checked — no usable config")
+                .with_hint("fix the config first, then run jumabek doctor again"),
+        ];
+    };
 
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
         Ok(client) => client,
-        Err(e) => return Check::new(Level::Warn, "LLM", format!("cannot probe: {}", e)),
+        Err(e) => {
+            return vec![Check::new(
+                Level::Warn,
+                "LLM",
+                format!("cannot probe: {}", e),
+            )];
+        }
     };
+
+    let mut checks = Vec::new();
+    for probe in llm_probes(config) {
+        checks.push(probe_llm_endpoint(&client, &probe).await);
+    }
+    checks
+}
+
+async fn probe_llm_endpoint(client: &reqwest::Client, probe: &LlmProbe) -> Check {
+    let endpoint = crate::core::llm::models_endpoint(&probe.base_uri);
+    let hint = "point base_uri at any OpenAI-compatible endpoint: a local runner such as\n\
+                Ollama or LM Studio, Ollama Cloud, OmniRoute, or a provider directly. An\n\
+                endpoint that wants no API key needs none.";
 
     match client
         .get(&endpoint)
-        .bearer_auth(&config.api_key)
+        .bearer_auth(&probe.api_key)
         .send()
         .await
     {
         Ok(response) if response.status().is_success() => {
             let body = response.text().await.unwrap_or_default();
-            let missing = models_in_use(config)
-                .into_iter()
-                .filter(|model| !body.contains(model))
+            let missing = probe
+                .models
+                .iter()
+                .filter(|model| !body.contains(model.as_str()))
                 .collect::<Vec<_>>();
 
             if missing.is_empty() {
                 Check::new(
                     Level::Ok,
-                    "LLM",
-                    format!(
-                        "{} · {}",
-                        config.llm.base_uri,
-                        models_in_use(config).join(", ")
-                    ),
+                    &probe.label,
+                    format!("{} · {}", probe.base_uri, probe.models.join(", ")),
                 )
             } else {
                 Check::new(
                     Level::Warn,
-                    "LLM",
+                    &probe.label,
                     format!(
                         "{} is reachable but does not list {}",
-                        config.llm.base_uri,
+                        probe.base_uri,
                         missing
                             .iter()
                             .map(|m| format!("'{}'", m))
@@ -251,14 +327,14 @@ async fn check_llm(config: Option<&Config>) -> Check {
         }
         Ok(response) => Check::new(
             Level::Warn,
-            "LLM",
-            format!("{} answered {}", config.llm.base_uri, response.status()),
+            &probe.label,
+            format!("{} answered {}", probe.base_uri, response.status()),
         )
         .with_hint(hint),
         Err(_) => Check::new(
             Level::Warn,
-            "LLM",
-            format!("{} is not reachable", config.llm.base_uri),
+            &probe.label,
+            format!("{} is not reachable", probe.base_uri),
         )
         .with_hint(hint),
     }

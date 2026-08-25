@@ -552,10 +552,10 @@ grant that spawned it.
 > why the config section is called `preflight` and not `sandbox`.
 
 **A local model connects; that is not the same as working.** The transport has been checked
-against a router and against Ollama, with a key and without. What a small local model does
-not give you is the agent itself: every turn has to come back as one JSON object in a fixed
-action format, and a 4B model will miss it often. Treat "it connects" and "it can drive the
-loop" as separate questions.
+against Ollama, Ollama Cloud and OmniRoute, with a key and without. What a small local model
+does not give you is the agent itself: every turn has to come back as one JSON object in a
+fixed action format, and a 4B model will miss it often. Treat "it connects" and "it can drive
+the loop" as separate questions.
 
 **Voice is only half proven.** Capture has now met real hardware: the device is found, the
 stream arrives, and speech is detected against the noise floor on a USB headset — that much
