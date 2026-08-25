@@ -37,6 +37,7 @@ pub struct SystemInfo {
     pub shell: String,
     pub current_time: String,
     pub cwd: String,
+    pub jumabek_home: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

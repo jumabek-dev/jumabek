@@ -2070,6 +2070,9 @@ fn system_info() -> SystemInfo {
         cwd: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        jumabek_home: crate::configs::jumabek_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     }
 }
 

@@ -206,6 +206,7 @@ mod tests {
                 shell: "powershell".to_string(),
                 current_time: "2026-07-28T00:00:00Z".to_string(),
                 cwd: "C:\\Users\\test".to_string(),
+                jumabek_home: "C:\\Users\\test\\.jumabek".to_string(),
             },
             system_response: None,
             skills: Vec::new(),
@@ -337,12 +338,12 @@ mod tests {
             })
             .collect();
 
-        let built = ContextBuilder::new("SYSTEM", 4_000)
+        let built = ContextBuilder::new("SYSTEM", 5_000)
             .build(&history, &task_object())
             .unwrap();
 
         assert!(built.trimmed_messages > 0, "nothing was trimmed");
-        assert!(built.total_tokens <= 4_000 * BUDGET_PERCENT / 100);
+        assert!(built.total_tokens <= 5_000 * BUDGET_PERCENT / 100);
         assert!(built.messages[1].content.contains("were trimmed"));
         assert!(
             built
