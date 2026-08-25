@@ -4,7 +4,7 @@
 db_path = "~/.jumabek/jumabek.db"
 
 [llm]
-model = "gpt-oss:20b"
+model = "gpt-oss:20b-cloud"
 base_uri = "http://localhost:11434"
 system_prompt_path = "./prompt.md"
 context_token_limit = 200000

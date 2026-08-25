@@ -6,17 +6,22 @@
     irm https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.ps1 | iex
 
 .EXAMPLE
-    .\install.ps1 -Version v1.0.0 -Yes
-#>
-[CmdletBinding()]
-param(
-    [string]$Version = "latest",
-    [string]$Repo = "jumabek-dev/jumabek",
-    [switch]$Yes
-)
+    $env:JUMABEK_VERSION = "v1.0.0"; $env:JUMABEK_YES = "1"
+    irm https://raw.githubusercontent.com/jumabek-dev/jumabek/main/install.ps1 | iex
 
+.NOTES
+    No param() block here on purpose — Invoke-Expression (the "iex" in
+    "irm ... | iex") does not create a script scope, so a top-level param()
+    is a parse error under it. Configure via environment variables instead;
+    they work the same way whether the script is piped through iex or saved
+    and run directly.
+#>
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+$Version = if ($env:JUMABEK_VERSION) { $env:JUMABEK_VERSION } else { "latest" }
+$Repo = if ($env:JUMABEK_REPO) { $env:JUMABEK_REPO } else { "jumabek-dev/jumabek" }
+$Yes = [bool]$env:JUMABEK_YES
 
 $Home_ = Join-Path $env:USERPROFILE ".jumabek"
 $BinDir = Join-Path $Home_ "bin"
