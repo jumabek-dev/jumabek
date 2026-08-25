@@ -1071,6 +1071,16 @@
       Name all three under <code>[llm.intelligence]</code> and it is on. Name none
       and nothing changes — one model, exactly as before.
     </p>
+
+    <p class="lede">
+      Each level can also point at its own endpoint instead of sharing one — a local Ollama for
+      <code>low</code>, Ollama Cloud or anything else for <code>medium</code> and
+      <code>high</code> — and its own protocol: OpenAI-shaped (<code>/v1/chat/completions</code>)
+      or Anthropic-shaped (<code>/v1/messages</code>, which Ollama and the real Anthropic API
+      both speak). Where the protocol allows it, JumaBek asks the endpoint for JSON matching the
+      exact action schema instead of trusting the model to remember the formatting rules —
+      falling back to reading a plain-text reply wherever it does not.
+    </p>
   </div>
 </section>
 
@@ -1470,7 +1480,7 @@ localhost:20129/notify
           </thead>
           <tbody>
             <tr>
-              <td>An OpenAI-compatible endpoint</td>
+              <td>An OpenAI- or Anthropic-compatible endpoint</td>
               <td>nothing works</td>
             </tr>
             <tr>

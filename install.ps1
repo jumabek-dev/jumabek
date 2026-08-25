@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Installs JumaBek on Windows.
 

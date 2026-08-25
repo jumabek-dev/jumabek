@@ -284,9 +284,10 @@ async fn check_llm(config: Option<&Config>) -> Vec<Check> {
 
 async fn probe_llm_endpoint(client: &reqwest::Client, probe: &LlmProbe) -> Check {
     let endpoint = crate::core::llm::models_endpoint(&probe.base_uri);
-    let hint = "point base_uri at any OpenAI-compatible endpoint: a local runner such as\n\
-                Ollama or LM Studio, Ollama Cloud, OmniRoute, or a provider directly. An\n\
-                endpoint that wants no API key needs none.";
+    let hint = "point base_uri at any OpenAI- or Anthropic-compatible endpoint (set protocol\n\
+                accordingly): a local runner such as Ollama or LM Studio, Ollama Cloud,\n\
+                OmniRoute, or a provider directly. An endpoint that wants no API key needs\n\
+                none.";
 
     match client
         .get(&endpoint)

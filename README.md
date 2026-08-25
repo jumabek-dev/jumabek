@@ -115,7 +115,7 @@ guessed at.
 
 | Dependency | Without it |
 | :--- | :--- |
-| An OpenAI-compatible endpoint | nothing works |
+| An OpenAI- or Anthropic-compatible endpoint | nothing works |
 | Rust toolchain | it runs, but cannot write itself Rust skills |
 | Python 3 / Node | the same, for skills in those languages |
 | Docker | new skills are refused, because they cannot be checked first |
@@ -143,14 +143,17 @@ guessed at.
 ```
 
 > [!NOTE]
-> **Any OpenAI-compatible endpoint.** Point `[llm].base_uri` at a local runner (Ollama, LM
-> Studio, llama.cpp), at a router in front of several providers, or at a provider directly.
-> The client sends `model`, `messages` and `stream`, and reads `choices[0].message.content`
-> — nothing beyond that is assumed.
+> **Any OpenAI- or Anthropic-compatible endpoint.** Point `[llm].base_uri` at a local runner
+> (Ollama, LM Studio, llama.cpp), at a router in front of several providers, or at a provider
+> directly. By default the client speaks OpenAI's shape — sends `model`, `messages` and
+> `stream`, reads `choices[0].message.content` — nothing beyond that is assumed. Set
+> `protocol = "anthropic"` to speak `/v1/messages` instead: `system` separated out, `x-api-key`
+> instead of `Authorization`, `content` blocks instead of `choices`. Ollama and the real
+> Anthropic API both answer there.
 >
 > Write the address the way its own documentation gives it: with `/v1` on the end or
 > without, both land in the same place. An endpoint that wants no API key needs none —
-> leave it unset and no `Authorization` header is sent.
+> leave it unset and no auth header is sent.
 >
 > What a local model does **not** get you for free is the agent itself: every turn has to
 > come back as one JSON object in a fixed action format, and a small model will miss it
@@ -211,7 +214,8 @@ notice. So the core moves it, on events rather than opinions:
 | **Writing a skill** | Always the highest level, before the first line of code. A cheap model has no way of telling that the skill it just wrote is bad, and the cost of being wrong is a binary that lives on your machine for months |
 | **Two unreadable answers** | The model is not holding the response format. Another attempt at the same level is a wasted turn |
 | **A build that keeps failing** | The code is above this level |
-| **A task running out of iterations** | Circling, rather than working |
+| **The same call three turns running** | Not a long job, a stuck one — repeating a call is the actual signal, not the iteration count |
+| **Nearly out of iterations, nothing else caught it** | A last-resort net for a model that never escalates itself |
 | **Nobody at the keyboard** | Scheduled jobs and anything arriving through the inbox start at `low` |
 
 An escalation that was not the task's fault does not spend an iteration. The turn failed
@@ -221,6 +225,34 @@ afternoon does not leave the expensive model running all week.
 
 Each answered turn records the level it ran on, and the turn where the level moved records
 why — otherwise there is no way to tell whether any of this earns its keep.
+
+### One level, one provider — or three
+
+Each level can point at its own endpoint instead of sharing `[llm].base_uri` — a local Ollama
+for `low`, Ollama Cloud or anything else for `medium` and `high`:
+
+```toml
+[llm.intelligence.endpoints.low]
+base_uri = "http://localhost:11434"
+protocol = "openai"
+reasoning_effort = "none"
+context_token_limit = 128000
+
+[llm.intelligence.endpoints.high]
+base_uri = "https://ollama.com"
+protocol = "anthropic"
+```
+
+`protocol` is `openai` (`/v1/chat/completions`) or `anthropic` (`/v1/messages` — Ollama and the
+real Anthropic API both speak it). Anything left unset — `base_uri`, `api_key` (kept in
+`secrets.toml`, under `[llm.levels]`), `reasoning_effort`, `context_token_limit`,
+`structured_output` — falls back to `[llm]`, the same "name none, nothing changes" rule as the
+model names above.
+
+Where the protocol supports it, `structured_output` (on by default) asks the provider for JSON
+matching the exact action schema — `response_format` on an OpenAI-shaped endpoint, a forced tool
+call on an Anthropic-shaped one — instead of trusting the model to remember "no markdown fence."
+Where a provider does not honour that, JumaBek reads a plain-text reply the way it always has.
 
 ### Memory
 
