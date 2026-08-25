@@ -205,6 +205,7 @@ mod tests {
                 os: "Windows 11".to_string(),
                 shell: "powershell".to_string(),
                 current_time: "2026-07-28T00:00:00Z".to_string(),
+                cwd: "C:\\Users\\test".to_string(),
             },
             system_response: None,
             skills: Vec::new(),

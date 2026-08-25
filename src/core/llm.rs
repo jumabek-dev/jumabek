@@ -382,18 +382,38 @@ fn extract_openai_content(raw: &serde_json::Value, body: &str) -> JumabekResult<
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    if content.trim().is_empty() {
-        let finish_reason = first
-            .get("finish_reason")
-            .and_then(|f| f.as_str())
-            .unwrap_or("unknown");
-        return Err(JumabekError::LlmInvalidResponse(format!(
-            "model returned empty content (finish_reason: {})",
-            finish_reason
-        )));
+    if !content.trim().is_empty() {
+        return Ok(content.to_string());
     }
 
-    Ok(content.to_string())
+    // Some models (gpt-oss on Ollama, notably) answer a json_schema request through the
+    // tool_calls channel instead of content, sometimes with a tool that was never offered.
+    // Hand whatever arguments came back to the same parser content normally goes through —
+    // it either matches the schema, or it doesn't and the existing unreadable-answer retry
+    // handles it, instead of this failing outright on every such turn.
+    let tool_arguments = first
+        .get("message")
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|calls| calls.as_array())
+        .and_then(|calls| calls.first())
+        .and_then(|call| call.get("function"))
+        .and_then(|f| f.get("arguments"))
+        .and_then(|a| a.as_str());
+
+    if let Some(arguments) = tool_arguments
+        && !arguments.trim().is_empty()
+    {
+        return Ok(arguments.to_string());
+    }
+
+    let finish_reason = first
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("unknown");
+    Err(JumabekError::LlmInvalidResponse(format!(
+        "model returned empty content (finish_reason: {})",
+        finish_reason
+    )))
 }
 
 fn extract_anthropic_content(raw: &serde_json::Value, body: &str) -> JumabekResult<String> {
@@ -565,6 +585,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("length"), "got: {err}");
+    }
+
+    #[test]
+    fn falls_back_to_tool_calls_when_content_is_empty() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "container.exec",
+                            "arguments": "{\"message\":\"hi\",\"is_done\":true,\"actions\":[]}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+
+        let content = extract_content(&body, Protocol::OpenAi).unwrap();
+        assert_eq!(content, r#"{"message":"hi","is_done":true,"actions":[]}"#);
+    }
+
+    #[test]
+    fn empty_tool_calls_still_reports_finish_reason() {
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "", "tool_calls": [] }, "finish_reason": "tool_calls" }]
+        })
+        .to_string();
+
+        let err = extract_content(&body, Protocol::OpenAi)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool_calls"), "got: {err}");
     }
 
     #[test]

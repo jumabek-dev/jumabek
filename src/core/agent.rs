@@ -34,6 +34,11 @@ const PARSE_CORRECTION: &str = "Your previous answer could not be read as an age
      prose before or after it, no markdown fence. If the last answer was cut off, make this one \
      shorter.";
 
+const STALL_CORRECTION: &str = "Your last answer said is_done: false but sent no actions, so \
+     nothing actually ran — a message like \"one moment\" or \"checking now\" is not itself an \
+     action. Either send a real action (ExecuteModule, PromptToUser, SpawnAgent, ...) this turn, \
+     or set is_done: true if you are actually finished.";
+
 const CAPABILITIES: [&str; 13] = [
     "ExecuteModule",
     "PermissionRequest",
@@ -56,7 +61,13 @@ const CIRCLING_REPEATS: usize = 3;
 
 const CIRCLING_FALLBACK_PERCENT: u32 = 85;
 
+const STALL_FINGERPRINT: &str = "__stall__";
+
 fn execute_fingerprint(response: &AgentResponse) -> Option<String> {
+    if response.actions.is_empty() && !response.is_done {
+        return Some(STALL_FINGERPRINT.to_string());
+    }
+
     let mut calls: Vec<String> = response
         .actions
         .iter()
@@ -1318,12 +1329,12 @@ impl Agent {
             }
         }
 
-        if results.is_empty() {
+        if response.is_done {
             return Ok(StepOutcome::Finished);
         }
 
-        if response.is_done {
-            return Ok(StepOutcome::Finished);
+        if results.is_empty() {
+            return Ok(StepOutcome::Continue(STALL_CORRECTION.to_string()));
         }
 
         Ok(StepOutcome::Continue(results.join("\n")))
@@ -2056,6 +2067,9 @@ fn system_info() -> SystemInfo {
             std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
         },
         current_time: Local::now().to_rfc3339(),
+        cwd: std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -2325,7 +2339,25 @@ mod expansion_tests {
     #[test]
     fn a_plain_answer_has_no_fingerprint() {
         assert!(execute_fingerprint(&response_with(vec![ActionType::RespondToUser])).is_none());
-        assert!(execute_fingerprint(&response_with(Vec::new())).is_none());
+    }
+
+    #[test]
+    fn a_finished_response_with_no_actions_has_no_fingerprint() {
+        let finished = AgentResponse {
+            message: String::new(),
+            is_done: true,
+            actions: Vec::new(),
+        };
+        assert!(execute_fingerprint(&finished).is_none());
+    }
+
+    #[test]
+    fn an_unfinished_response_with_no_actions_is_a_stall() {
+        assert_eq!(
+            execute_fingerprint(&response_with(Vec::new())),
+            Some(STALL_FINGERPRINT.to_string()),
+            "is_done: false with no actions is not silence, it is stalling"
+        );
     }
 
     #[test]
