@@ -63,7 +63,9 @@ fn capture_loop(mut reader: impl Read, gate: VoiceGate, tx: UnboundedSender<Vec<
         was_capturing = true;
 
         let frame: Vec<i16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
@@ -107,7 +109,9 @@ pub fn level_check(seconds: u64) -> JumabekResult<()> {
         }
 
         let frame: Vec<i16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
