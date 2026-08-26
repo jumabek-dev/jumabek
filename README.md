@@ -18,6 +18,8 @@ it is allowed near your files.
 
 [Install](#install) · [How it works](#how-it-works) · [Writing skills](#writing-skills) · [Safety](#safety) · [Limits](#what-it-does-not-do) · [Site](https://jumabek-dev.github.io/jumabek/)
 
+<img src="docs/demo.gif" alt="JumaBek writing itself a skill" width="100%">
+
 ---
 
 ## A real session
