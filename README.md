@@ -18,42 +18,18 @@ it is allowed near your files.
 
 [Install](#install) · [How it works](#how-it-works) · [Writing skills](#writing-skills) · [Safety](#safety) · [Limits](#what-it-does-not-do) · [Site](https://jumabek-dev.github.io/jumabek/)
 
-<img src="docs/demo.gif" alt="JumaBek writing itself a skill" width="100%">
-
 ---
 
 ## A real session
 
 Asked for something it has no skill for, JumaBek notices, explains what is missing, and asks
-before writing anything.
+before writing anything. Recorded, not reconstructed:
 
-```console
-> I need to parse RSS feeds regularly and pull out the headlines
+<img src="docs/demo.gif" alt="JumaBek writing itself a skill" width="100%">
 
-  I have shell_executor, but it only runs commands. Parsing RSS needs an HTTP
-  client and an XML parser, which a shell does not have. I suggest building a
-  skill called rss_parser. Shall I start?
-
-  permission  MEDIUM   write a new skill 'rss_parser' in Rust
-  Write, build and install a new skill 'rss_parser' in Rust. The code is written
-  by the model and built on this machine; once installed it loads in every
-  future session.
-
-  allow? [y/N] y
-  allowed
-
-  · rss_parser: preflight passed in docker engine 28.5.1 —
-      build: 2 cpu / 2g ram, network on · run: 0.5 cpu / 256m, no network, read-only
-  · rss_parser: built and validated
-  · rss_parser is live: fetch_titles, fetch_titles_formatted
-
-  · rss_parser · fetch_titles_formatted
-
-  Here are the headlines from Hacker News: ...
-```
-
-Forty-nine seconds from the request to a working result. The skill stays installed and loads
-on every later run.
+The permission prompt leads with what it is about to do, not with the task. Everything after
+it — the container check, the build, the validation — runs unattended, and the skill stays
+installed and loads on every later run.
 
 ---
 

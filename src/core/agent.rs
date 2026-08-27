@@ -63,8 +63,12 @@ const CIRCLING_FALLBACK_PERCENT: u32 = 85;
 
 const STALL_FINGERPRINT: &str = "__stall__";
 
+fn is_stall(response: &AgentResponse) -> bool {
+    response.actions.is_empty() && !response.is_done
+}
+
 fn execute_fingerprint(response: &AgentResponse) -> Option<String> {
-    if response.actions.is_empty() && !response.is_done {
+    if is_stall(response) {
         return Some(STALL_FINGERPRINT.to_string());
     }
 
@@ -368,10 +372,7 @@ impl Agent {
     }
 
     async fn escalate(&self, ui: &mut dyn UserInterface, reason: Reason) -> JumabekResult<()> {
-        let target = match self.level().await {
-            Level::Low => Level::Medium,
-            Level::Medium | Level::High => Level::High,
-        };
+        let target = reason.escalation_from(self.level().await);
 
         if self.move_to(target, reason).await {
             let standing = self.intelligence.read().await;
@@ -536,7 +537,7 @@ impl Agent {
             self.log_turn(&task, &reply.response, &reply.raw_content)
                 .await?;
 
-            if !reply.response.message.trim().is_empty() {
+            if !reply.response.message.trim().is_empty() && !is_stall(&reply.response) {
                 last_message = reply.response.message.clone();
                 if task.depth == 0 {
                     ui.show_response(&reply.response.message).await?;
@@ -2360,6 +2361,35 @@ mod expansion_tests {
             execute_fingerprint(&response_with(Vec::new())),
             Some(STALL_FINGERPRINT.to_string()),
             "is_done: false with no actions is not silence, it is stalling"
+        );
+    }
+
+    #[test]
+    fn a_stalled_turn_is_not_shown_to_the_user() {
+        let stalled = AgentResponse {
+            message: "Let me check that for you.".to_string(),
+            is_done: false,
+            actions: Vec::new(),
+        };
+        assert!(
+            is_stall(&stalled),
+            "a turn with no actions and is_done: false is the one the core corrects"
+        );
+
+        let answered = AgentResponse {
+            message: "Let me check that for you.".to_string(),
+            is_done: true,
+            actions: Vec::new(),
+        };
+        let working = AgentResponse {
+            message: "Let me check that for you.".to_string(),
+            is_done: false,
+            actions: vec![execute("shell_executor", "execute_command", "ls")],
+        };
+        assert!(!is_stall(&answered), "a finished answer was withheld");
+        assert!(
+            !is_stall(&working),
+            "a turn that is doing work was withheld"
         );
     }
 

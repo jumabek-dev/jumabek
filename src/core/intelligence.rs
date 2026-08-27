@@ -90,6 +90,16 @@ impl Reason {
         }
     }
 
+    pub fn escalation_from(self, current: Level) -> Level {
+        match self {
+            Reason::WritingASkill => Level::High,
+            _ => match current {
+                Level::Low => Level::Medium,
+                Level::Medium | Level::High => Level::High,
+            },
+        }
+    }
+
     pub fn refunds_the_iteration(self) -> bool {
         matches!(self, Reason::UnreadableAnswer | Reason::Circling)
     }
@@ -136,6 +146,35 @@ mod tests {
         assert!(Reason::Circling.refunds_the_iteration());
         assert!(!Reason::WritingASkill.refunds_the_iteration());
         assert!(!Reason::ModelAsked.refunds_the_iteration());
+    }
+
+    #[test]
+    fn writing_a_skill_goes_straight_to_the_top_from_any_level() {
+        for start in Level::ALL {
+            assert_eq!(
+                Reason::WritingASkill.escalation_from(start),
+                Level::High,
+                "a skill was written at less than the highest level, starting from {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_failure_climbs_one_step_at_a_time() {
+        assert_eq!(
+            Reason::UnreadableAnswer.escalation_from(Level::Low),
+            Level::Medium,
+            "one bad turn should try the next level, not the dearest one"
+        );
+        assert_eq!(
+            Reason::UnreadableAnswer.escalation_from(Level::Medium),
+            Level::High
+        );
+        assert_eq!(
+            Reason::Circling.escalation_from(Level::High),
+            Level::High,
+            "there is nothing above the top"
+        );
     }
 
     #[test]
