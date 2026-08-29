@@ -135,6 +135,11 @@ fn decode_console_output(bytes: &[u8]) -> String {
     }
 }
 
+fn kills_by_pattern(command: &str) -> bool {
+    let low = command.to_lowercase();
+    low.contains("pkill -f") || low.contains("pkill -9 -f") || low.contains("killall")
+}
+
 fn truncate_text(s: String) -> String {
     match s.char_indices().nth(MAX_OUTPUT_CHARS) {
         Some((idx, _)) => format!(
@@ -435,6 +440,15 @@ impl SkillModule for ShellExecutor {
                     " (program not found — check it is installed and on PATH; \
                      JumaBek inherits the PATH of the process that launched it)",
                 );
+            } else if output.status.code().is_none() && kills_by_pattern(args) {
+                msg.push_str(
+                    " (killed by a signal, and the command matches processes by pattern — \
+                     pkill -f and killall match whole command lines, including the line of \
+                     the shell running this very command, so the pattern killed the shell \
+                     itself and nothing after it ran. Match something longer that only the \
+                     target has, such as pkill -f '/node_modules/.bin/vite', or find the pid \
+                     first and kill that pid)",
+                );
             }
 
             if !stdout.trim().is_empty() {
@@ -464,4 +478,31 @@ async fn main() {
     jumabek_sdk::runtime::run_skill(ShellExecutor::new())
         .await
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pattern_kill_is_recognised_however_it_is_written() {
+        for command in [
+            "pkill -f vite",
+            "pkill -9 -f vite",
+            "killall node",
+            "echo start; PKILL -F Vite; echo done",
+        ] {
+            assert!(kills_by_pattern(command), "missed: {command}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_kill_is_left_alone() {
+        for command in ["kill -9 4213", "ls -la", "cargo build", "kill $(cat pid)"] {
+            assert!(
+                !kills_by_pattern(command),
+                "would blame self-termination for: {command}"
+            );
+        }
+    }
 }

@@ -279,6 +279,23 @@ calling it; a guessed method name costs a turn.
 Re-read that list before deciding something is impossible. The answer is often already
 installed.
 
+## The shell has three traps
+
+**`pkill -f` matches whole command lines, including your own.** The shell running your
+command has that command in its argv, so a pattern that appears literally in the same call
+kills the shell itself, and nothing after it runs. Match something only the target has —
+`pkill -f '/node_modules/.bin/vite'` — or find the pid first and kill the pid.
+
+**Anything you send to the background must redirect both streams to a file:**
+`> log 2>&1 < /dev/null &`. A backgrounded process inherits the pipe and holds it open, and
+the call sits there until the 300 second timeout kills it. You get nothing back and lose the
+turn.
+
+**One call, one step.** Do not chain writing a file, killing a process, building, starting a
+server and probing an endpoint into a single command. When something in the middle fails
+there is no way to tell what already ran, and the permission request becomes a wall of text
+nobody can approve.
+
 ## Skills you can build
 
 Nobody has to ask. When a task needs something you cannot do, you notice and you propose it.

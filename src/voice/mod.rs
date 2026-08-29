@@ -110,6 +110,71 @@ impl Voice {
             .map(|word| word.to_string())
     }
 
+    const SPOKEN_ACTION_LIMIT: usize = 100;
+
+    fn needs_the_keyboard(risk_level: &str) -> bool {
+        !matches!(risk_level.trim().to_lowercase().as_str(), "low")
+    }
+
+    fn speakable_action(action: &str, description: &str) -> String {
+        let action = action.trim();
+        if action.chars().count() >= 12 {
+            return action.to_string();
+        }
+
+        let first = description.lines().next().unwrap_or("").trim();
+        if first.is_empty() {
+            return action.to_string();
+        }
+
+        let mut cut: String = first.chars().take(Self::SPOKEN_ACTION_LIMIT).collect();
+        if first.chars().count() > Self::SPOKEN_ACTION_LIMIT || description.lines().count() > 1 {
+            cut.push_str(", остальное на экране");
+        }
+
+        if action.is_empty() {
+            cut
+        } else {
+            format!("{}. {}", action, cut)
+        }
+    }
+
+    async fn confirm_on_screen(&mut self) -> JumabekResult<bool> {
+        loop {
+            print!("  allow? [y/N] ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let line = tokio::task::spawn_blocking(|| {
+                let mut buffer = String::new();
+                match std::io::stdin().read_line(&mut buffer) {
+                    Ok(0) => None,
+                    Ok(_) => Some(buffer.trim().to_lowercase()),
+                    Err(_) => None,
+                }
+            })
+            .await
+            .map_err(|e| JumabekError::InternalError(e.to_string()))?;
+
+            let Some(answer) = line else {
+                println!("  denied");
+                return Ok(false);
+            };
+
+            match answer.as_str() {
+                "y" | "yes" | "д" | "да" => {
+                    println!("  allowed");
+                    return Ok(true);
+                }
+                "" | "n" | "no" | "н" | "нет" => {
+                    println!("  denied");
+                    return Ok(false);
+                }
+                _ => println!("  answer y or n"),
+            }
+        }
+    }
+
     fn is_affirmative(answer: &str) -> bool {
         Self::first_word(answer).is_some_and(|word| {
             matches!(
@@ -213,9 +278,28 @@ impl UserInterface for Voice {
         description: &str,
         risk_level: &str,
     ) -> JumabekResult<bool> {
+        println!();
+        println!("  permission  {}  {}", risk_level.to_uppercase(), action);
+        for line in description.lines() {
+            println!("  {}", line);
+        }
+        println!();
+
+        let spoken_action = Self::speakable_action(action, description);
+
+        if Self::needs_the_keyboard(risk_level) {
+            self.say(&format!(
+                "Нужно разрешение, уровень риска {}. {}. Подтверди на экране.",
+                risk_level, spoken_action
+            ))
+            .await?;
+
+            return self.confirm_on_screen().await;
+        }
+
         self.say(&format!(
-            "Нужно разрешение, уровень риска {}. {}. {}. Разрешить?",
-            risk_level, action, description
+            "Нужно разрешение, уровень риска {}. {}. Разрешить?",
+            risk_level, spoken_action
         ))
         .await?;
 
@@ -301,6 +385,52 @@ mod tests {
             assert!(!Voice::is_affirmative(unclear), "{unclear}");
             assert!(!Voice::is_negative(unclear), "{unclear}");
         }
+    }
+
+    #[test]
+    fn only_low_risk_may_be_approved_by_voice() {
+        assert!(!Voice::needs_the_keyboard("low"));
+        for risky in ["medium", "high", "MEDIUM", " High ", "unknown"] {
+            assert!(
+                Voice::needs_the_keyboard(risky),
+                "{risky} could be approved by a stray sentence the mic picked up"
+            );
+        }
+    }
+
+    #[test]
+    fn the_command_itself_is_never_spoken() {
+        let command =
+            "cat > /tmp/x.cs <<'EOF'\n".to_string() + &"public class A { }\n".repeat(200) + "EOF";
+        let spoken = Voice::speakable_action("run a shell command", &command);
+
+        assert!(
+            spoken.chars().count() < 200,
+            "the whole heredoc was queued for the speaker: {} chars",
+            spoken.chars().count()
+        );
+        assert!(!spoken.contains("public class"), "{spoken}");
+    }
+
+    #[test]
+    fn a_terse_action_borrows_the_first_line_and_says_where_the_rest_is() {
+        let spoken = Voice::speakable_action("run", "npm run build\nnpm test");
+
+        assert!(spoken.contains("npm run build"), "{spoken}");
+        assert!(
+            spoken.contains("на экране"),
+            "no pointer to the screen: {spoken}"
+        );
+        assert!(
+            !spoken.contains("npm test"),
+            "spoke past the first line: {spoken}"
+        );
+    }
+
+    #[test]
+    fn a_self_explaining_action_is_spoken_alone() {
+        let spoken = Voice::speakable_action("delete 340 old log files", "rm -rf /var/log/old/*");
+        assert_eq!(spoken, "delete 340 old log files");
     }
 
     #[test]
