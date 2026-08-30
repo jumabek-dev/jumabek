@@ -204,6 +204,33 @@ afternoon does not leave the expensive model running all week.
 Each answered turn records the level it ran on, and the turn where the level moved records
 why — otherwise there is no way to tell whether any of this earns its keep.
 
+### What a turn actually costs
+
+The number printed while it works is a local estimate, made before the request is sent so it
+can decide what fits. What the provider counted is a different number, recorded separately
+and labelled as such — on Cyrillic against a Claude model the two differ by about ten
+percent, which is a tokenizer that does not belong to that model.
+
+```console
+$ jumabek tokens
+  cc/claude-opus-4-6 · openai
+       3 turn(s) · 61959 in · 63 out — counted by the provider
+       56220 in — guessed locally before sending
+       caching: 58864 read, 0 written, over 3 of 3 turn(s)
+```
+
+The standing part of the context — the system prompt and the pinned facts — is marked for
+caching, and everything that changes each turn sits after that mark. Put the mark on the
+wrong side and every turn is a miss. In a real conversation about ninety-five percent of the
+input comes back from cache, and the uncached part stays around a thousand tokens however
+long the conversation gets.
+
+A provider that reports nothing about caching is recorded as silent, not as a miss — those
+are different facts and only one of them is a problem.
+
+The cache belongs to one model. Dropping to a cheaper one mid-task and coming back pays to
+re-read the whole context twice, so it is refused; going up once and staying there is not.
+
 ### One level, one provider — or three
 
 Each level can point at its own endpoint instead of sharing `[llm].base_uri` — a local Ollama
@@ -396,6 +423,11 @@ outside its list.
 
 The model can ask for a key for a skill it wrote, and the core generates it, writes it and
 hands it over — the model never sees the token and cannot edit those files itself.
+
+**Each source and person is a running conversation.** Turns that arrived from the same place
+and the same person are threaded together and survive a restart, so "как в прошлый раз" from
+a Telegram chat means the last time in that chat. That thread is separate from what you type
+in the terminal: the terminal sees the inbox turns, the inbox side sees only its own.
 
 ### Changing settings while it runs
 
@@ -599,7 +631,7 @@ was, and when it heard something it could not make out.
 
 ## Safety
 
-Self-improvement means running code that did not exist a minute ago. Five things stand
+Self-improvement means running code that did not exist a minute ago. Six things stand
 between that and your machine, and each exists because of something that actually went wrong.
 
 **Dangerous commands are stopped by the core, not by the model.** Recursive deletes, disk
@@ -632,8 +664,14 @@ moment it matters. A job cannot: there is nobody at the prompt at three in the m
 approving one means approving a list of skills, and separately whether it may write new
 skills or step past a safety rule — and the question leads with that list rather than with
 the task. A job that tries anything else is refused and says so in its report; it cannot
-ask, and it cannot delegate its way around the limit, because a sub-agent inherits the
-grant that spawned it.
+delegate its way around the limit, because a sub-agent inherits the grant that spawned it,
+narrowed further by its role.
+
+**Rights only ever narrow sideways.** When one agent asks another to do something, what the
+second may do is the intersection of both, never the union — otherwise an agent without shell
+access reaches a shell by asking a peer, and nothing in the record shows a permission was
+granted. Needing more means asking upward instead, under a ceiling in `config.toml` that no
+decision at runtime can raise, and every answer is written down against whoever asked.
 
 ---
 
@@ -660,6 +698,19 @@ room and one microphone; `jumabek mic` will tell you how yours compares.
 
 **Parallelism helps across skills, not within one.** Two calls to the same skill share one
 connection and one working directory, so they are deliberately serialised.
+
+**Sub-agents die with the process.** They run in the same program, not as separate ones, so
+quitting takes them with it. You are told how many were dropped rather than left to guess.
+
+**Retrieval is not in the released binaries.** The ONNX runtime it needs has no prebuilt
+binary for every target in the release matrix, so shipping it by default would break the
+build for some of them. It is a cargo feature; without it every fact is loaded every turn,
+which is what happened before and still works.
+
+**Prompt caching depends on the provider.** The markers go out on both protocols and an
+endpoint that refuses them is dropped back to plain requests automatically — but whether
+anything is actually cached, and whether it is reported, is the provider's decision.
+`jumabek tokens` shows which of the two you are getting.
 
 ---
 

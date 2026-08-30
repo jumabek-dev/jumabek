@@ -734,6 +734,7 @@
     <div class="nav-links">
       <a href="#idea">Skills</a>
       <a href="#intelligence">Models</a>
+      <a href="#cooperation">Agents</a>
       <a href="#safety">Safety</a>
       <a href="#install">Install</a>
       <a href="#limitations">Limits</a>
@@ -1088,7 +1089,7 @@
   <div class="wrap stack-40">
     <div>
       <p class="eyebrow reveal">Safety</p>
-      <h2 class="reveal">Four things stand between generated code and your machine</h2>
+      <h2 class="reveal">Five things stand between generated code and your machine</h2>
       <p class="lede reveal">
         An agent that writes its own code runs code that did not exist a minute ago. These are
         the guards, and each exists because of something that actually went wrong.
@@ -1132,6 +1133,20 @@
         <p>
           Rolling back removes a skill that did not exist at that point, rather than merely
           restoring the files that did. And the rollback itself is snapshotted first.
+        </p>
+      </div>
+      <div class="card">
+        <svg class="icon" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="6" y="14" width="20" height="13" rx="2" />
+          <path d="M11 14 V10 A5 5 0 0 1 21 10 V14" />
+        </svg>
+        <span class="mark">Intersection, never union</span>
+        <h3>Rights only narrow sideways</h3>
+        <p>
+          When one agent asks another to do something, what the second may do is the
+          intersection of both, never the union. Needing more means asking upward, under a
+          ceiling in <code>config.toml</code> that no decision at runtime can raise — and
+          every answer, yes or no, is written down against whoever asked.
         </p>
       </div>
       <div class="card">
@@ -1184,6 +1199,88 @@ Before that you had me look for doc.txt and open it from Documents.</pre>
       When a conversation outgrows the context window, the oldest exchanges are dropped in
       whole task groups — never half of one, which would leave a result with no matching
       command — and replaced by a marker telling the model what it can still recall.
+    </p>
+
+    <p class="lede">
+      Facts it chose to keep sit in front of it. Writing a key again replaces what was there,
+      so a fact that changed stops being two facts that disagree; when a key honestly holds
+      two values it says so and both stay. A fact can be pinned so it is always present, or
+      scoped to a language or a project so one project's details do not bleed into another.
+      Turn on retrieval and the rest are picked by meaning instead of all being loaded every
+      turn — by a model that runs on your machine and sends nothing anywhere.
+    </p>
+  </div>
+</section>
+
+<section class="band" id="cooperation">
+  <div class="wrap stack-40">
+    <div>
+      <p class="eyebrow reveal">Cooperation</p>
+      <h2 class="reveal">Several of them, and a record of what they decided</h2>
+      <p class="lede reveal">
+        A copy can be given a role: a short brief, a list of skills, and what it may do. Its
+        rights are then the parent's narrowed by the role's — never the union. Without that
+        rule an agent with no shell access reaches a shell by asking a peer, and nothing in
+        the record shows a permission was ever granted.
+      </p>
+    </div>
+
+    <div class="term reveal">
+      <div class="term-bar">
+        <span class="tick"></span>
+        <span>jumabek agents</span>
+      </div>
+      <pre class="term-body wrapped">┌ agents (2) ─────────────────┐┌ board · g-4f21 ─────────────────────┐
+│&gt; 8ac71 researcher  running  ││#1 finding  8ac71 -&gt; everyone   open │
+│    skill · searxng_search   ││the 0.4.2 release has the same bug   │
+│  b3d90 writer      waiting  ││    #2 task  8ac71 -&gt; writer    open │
+│    asking permission        ││    turn that into two paragraphs    │
+└─────────────────────────────┘└─────────────────────────────────────┘
+┌ g-4f21 · work out why payments time out ────────────────────────────┐
+│████████████                    12 of 40 shared iterations           │
+└─────────────────────────────────────────────────────────────────────┘</pre>
+    </div>
+
+    <p class="lede">
+      Everything spawned from one task shares a group: one goal, one board, and one pot of
+      iterations for all of them together. The shared pot is not decoration — three agents
+      each comfortably under their own limit will otherwise pass work between themselves
+      indefinitely. The board is the single record: a conclusion that was not written there
+      did not happen.
+    </p>
+  </div>
+</section>
+
+<section class="band" id="cost">
+  <div class="wrap stack-40">
+    <div>
+      <p class="eyebrow reveal">Cost</p>
+      <h2 class="reveal">What a turn cost, not what it probably cost</h2>
+      <p class="lede reveal">
+        The number printed while it works is a local estimate, made before the request goes out
+        so it can decide what fits. What the provider counted is a different number, kept
+        separately and labelled as such — against a Claude model on Cyrillic the two differ by
+        about ten percent, which is a tokenizer that does not belong to that model.
+      </p>
+    </div>
+
+    <div class="term reveal">
+      <div class="term-bar">
+        <span class="tick"></span>
+        <span>jumabek tokens</span>
+      </div>
+      <pre class="term-body wrapped">cc/claude-opus-4-6 · openai
+     3 turn(s) · 61959 in · 63 out — counted by the provider
+     56220 in — guessed locally before sending
+     caching: 58864 read, 0 written, over 3 of 3 turn(s)</pre>
+    </div>
+
+    <p class="lede">
+      The standing part of the context is marked for caching and everything that changes each
+      turn sits after the mark; put it on the wrong side and every turn is a miss. In a real
+      conversation about ninety-five percent of the input comes back from cache. A provider
+      that reports nothing about caching is recorded as silent rather than as a miss — those
+      are different facts, and only one of them is a problem.
     </p>
   </div>
 </section>
@@ -1289,23 +1386,30 @@ allow? <span class="f">[y/N]</span> <span class="u">y</span>
     <div class="term reveal">
       <div class="term-bar">
         <span class="tick"></span>
-        <span>forty files in, one paragraph out</span>
+        <span>handed off, and the prompt comes straight back</span>
       </div>
       <pre class="term-body wrapped"><span class="f">&gt;</span> <span class="u">what is failing in the logs under
   C:/logs?</span>
 
+Handing that off.
 <span class="f">·</span> <span class="d">subagent · read every .log under C:/logs and list the error
   codes</span>
-<span class="f">·</span> <span class="d">shell_executor · execute_command</span>
-<span class="f">·</span> <span class="d">subagent · done in 12.4s</span>
+Handed off; I am free again.
 
-Three codes account for everything: E_TIMEOUT 41 times, all against the
-payments host, E_AUTH 9 times in a single burst at 04:12, and one E_DISK.</pre>
+<span class="f">&gt;</span> <span class="u">meanwhile, what is my disk at?</span>
+
+<span class="f">·</span> <span class="d">the agent you spawned for 'read every .log' finished in 12s and
+  reported: three codes account for everything — E_TIMEOUT 41 times,
+  all against the payments host, E_AUTH 9 in one burst at 04:12, one
+  E_DISK.</span></pre>
     </div>
 
     <p class="lede">
-      Nesting stops at two levels. Below that, a tree is almost always a task that failed to
-      decompose and started looping on itself.
+      Spawning returns at once. The copy works while the conversation carries on, and its
+      summary — never its transcript — arrives on a later turn, often after you have already
+      been answered. Nobody is at the keyboard on its side, so it cannot ask you anything:
+      give it work it can finish alone. Nesting stops at two levels, below which a tree is
+      almost always a task that failed to decompose.
     </p>
   </div>
 </section>
@@ -1386,6 +1490,13 @@ localhost:20129/notify
       knocks the moment something lands. <code>/ask</code> works the same way but
       returns the answer over that connection — which is how a bot JumaBek writes for itself
       gets its replies back.
+    </p>
+
+    <p class="lede">
+      Each source and person is a running conversation, threaded together and surviving a
+      restart, so "как в прошлый раз" from a Telegram chat means the last time in that chat.
+      That thread is separate from what you type in the terminal: the terminal sees the inbox
+      turns, the inbox side sees only its own.
     </p>
 
     <div class="grid reveal">
