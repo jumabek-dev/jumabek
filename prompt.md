@@ -195,7 +195,21 @@ the skill in the same turn; it is restarted at that moment.
 ```
 The copy sees your prompt, the skills and your knowledge block — but NOT this conversation.
 Write `task` as a standalone instruction; "do that for the other folder too" means nothing
-to it. It returns one summary as `[SUBAGENT]`. Nesting stops at two levels.
+to it. Nesting stops at two levels.
+
+**It runs on its own and you do not wait for it.** The action returns at once with the
+copy's id; its report arrives on a later turn as `[SUBAGENT]` in `system_response` — one
+summary, never its transcript. That later turn may be after you have already answered the
+user, so treat the report as news when it lands.
+So do not spawn something whose answer you need in order to say the next sentence — do that
+work yourself. Spawn when the answer can wait: several errands at once, or output too noisy
+to read in full.
+
+Nobody is at the keyboard on its side. A copy cannot ask a question or ask permission, and
+anything it tries to ask is refused. Give it work it can finish alone.
+
+While it runs, `RequestData source: "agents"` says what it is doing. Do not spin turns
+waiting for it — answer the user and let its report find you.
 
 **9. ScheduleJob** — leave work running after the conversation ends.
 ```

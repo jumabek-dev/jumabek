@@ -52,17 +52,22 @@ impl Notifier for SharedNotifier {
     }
 }
 
-struct JobUi {
+struct DetachedUi {
     notifier: Arc<dyn Notifier>,
-    name: String,
-    id: i64,
+    label: String,
 }
 
 pub fn detached_ui() -> impl UserInterface {
-    JobUi {
+    DetachedUi {
         notifier: Arc::new(SilentNotifier),
-        name: "inbox".to_string(),
-        id: 0,
+        label: "inbox".to_string(),
+    }
+}
+
+pub fn subagent_ui(notifier: Arc<dyn Notifier>, agent_id: &str) -> impl UserInterface {
+    DetachedUi {
+        notifier,
+        label: format!("subagent {}", &agent_id[..agent_id.len().min(8)]),
     }
 }
 
@@ -72,17 +77,15 @@ impl Notifier for SilentNotifier {
     fn notify(&self, _text: String) {}
 }
 
-impl JobUi {
+impl DetachedUi {
     fn line(&self, marker: &str, text: &str) {
-        self.notifier.notify(format!(
-            "  {} job {} · {} · {}",
-            marker, self.id, self.name, text
-        ));
+        self.notifier
+            .notify(format!("  {} {} · {}", marker, self.label, text));
     }
 }
 
 #[async_trait::async_trait]
-impl UserInterface for JobUi {
+impl UserInterface for DetachedUi {
     async fn read_request(&mut self) -> JumabekResult<Option<String>> {
         Ok(None)
     }
@@ -120,7 +123,7 @@ impl UserInterface for JobUi {
             &format!("wanted to ask '{}' — nobody is here", message),
         );
         Err(JumabekError::InternalError(format!(
-            "a background job tried to ask a question with {} option(s)",
+            "asked a question with {} option(s) with nobody at the keyboard",
             options.len()
         )))
     }
@@ -205,10 +208,9 @@ impl Scheduler {
         self.notifier
             .notify(format!("  · job {} · {} · running", job.id, job.name));
 
-        let mut ui = JobUi {
+        let mut ui = DetachedUi {
             notifier: Arc::clone(&self.notifier),
-            name: job.name.clone(),
-            id: job.id,
+            label: format!("job {} · {}", job.id, job.name),
         };
 
         let outcome = self
@@ -237,11 +239,10 @@ mod tests {
         }
     }
 
-    fn ui(collector: Arc<Collector>) -> JobUi {
-        JobUi {
+    fn ui(collector: Arc<Collector>) -> DetachedUi {
+        DetachedUi {
             notifier: collector,
-            name: "watcher".to_string(),
-            id: 7,
+            label: "job 7 · watcher".to_string(),
         }
     }
 

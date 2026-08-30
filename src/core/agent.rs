@@ -11,6 +11,7 @@ use crate::core::llm::{LlmClient, RequestTarget};
 use crate::core::planner;
 use crate::core::profile;
 use crate::core::safety;
+use crate::core::scheduler::Notifier;
 use crate::core::self_improvement::{Chunk, Outcome, Progress, SelfImprovement};
 use crate::core::task::{
     ActionType, AgentResponse, Constraints, Grant, InterfaceMode, Origin, SystemInfo, TaskObject,
@@ -28,6 +29,8 @@ use tokio::sync::RwLock;
 const INDEXED_CONTENT_LIMIT: usize = 2_000;
 
 const SKILL_METHOD_BUDGET: usize = 2_000;
+
+const REPORTS_KEPT: usize = 20;
 
 const PARSE_RETRIES: u32 = 2;
 
@@ -191,6 +194,9 @@ pub struct Agent {
     refund_iteration: RwLock<bool>,
     session_id: String,
     agents: Arc<AgentRegistry>,
+    me: std::sync::OnceLock<std::sync::Weak<Agent>>,
+    notifier: std::sync::RwLock<Arc<dyn Notifier>>,
+    reports: RwLock<Vec<(String, String)>>,
 }
 
 enum StepOutcome {
@@ -205,7 +211,7 @@ impl Agent {
         memory: Memory,
         registry: SkillRegistry,
         mode: InterfaceMode,
-    ) -> JumabekResult<Self> {
+    ) -> JumabekResult<Arc<Self>> {
         let llm = LlmClient::new(&config)?;
         let context =
             ContextBuilder::new(config.system_prompt.clone(), config.llm.context_token_limit);
@@ -213,7 +219,7 @@ impl Agent {
         let starting = config.llm.intelligence.starting_level();
         let starting_model = model_for(&config, starting);
 
-        Ok(Agent {
+        let agent = Arc::new(Agent {
             config: RwLock::new(config),
             memory,
             jobs,
@@ -233,7 +239,48 @@ impl Agent {
             refund_iteration: RwLock::new(false),
             session_id: uuid::Uuid::new_v4().to_string(),
             agents: Arc::new(AgentRegistry::new()),
-        })
+            me: std::sync::OnceLock::new(),
+            notifier: std::sync::RwLock::new(Arc::new(crate::core::scheduler::PlainNotifier)),
+            reports: RwLock::new(Vec::new()),
+        });
+
+        let _ = agent.me.set(Arc::downgrade(&agent));
+        Ok(agent)
+    }
+
+    pub fn notify_through(&self, notifier: Arc<dyn Notifier>) {
+        if let Ok(mut current) = self.notifier.write() {
+            *current = notifier;
+        }
+    }
+
+    fn tell(&self, text: String) {
+        let notifier = match self.notifier.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(_) => return,
+        };
+        notifier.notify(text);
+    }
+
+    fn shared(&self) -> Option<Arc<Agent>> {
+        self.me.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    async fn leave_report(&self, for_agent: &str, text: String) {
+        let mut waiting = self.reports.write().await;
+        queue_report(&mut waiting, for_agent, text);
+    }
+
+    async fn take_reports(&self, for_agent: &str) -> Vec<String> {
+        let mut waiting = self.reports.write().await;
+        drain_reports(&mut waiting, for_agent)
+    }
+
+    fn notifier_handle(&self) -> Arc<dyn Notifier> {
+        match self.notifier.read() {
+            Ok(current) => Arc::clone(&current),
+            Err(_) => Arc::new(crate::core::scheduler::PlainNotifier),
+        }
     }
 
     pub async fn reload(&self) -> JumabekResult<Vec<String>> {
@@ -556,6 +603,11 @@ impl Agent {
             task.intelligence = self.standing_for_task().await;
             self.agents.iteration(&task.agent_id, task.iteration).await;
             self.agents.doing(&task.agent_id, "thinking").await;
+
+            let delivered = self.take_reports(&task.agent_id).await;
+            if !delivered.is_empty() {
+                task.system_response = Some(join_reports(task.system_response.take(), delivered));
+            }
 
             let history = self.history_for(&task).await?;
             let profile = self.profile_block().await;
@@ -1175,6 +1227,15 @@ impl Agent {
                         continue;
                     }
 
+                    let Some(me) = self.shared() else {
+                        results.push(
+                            "[SUBAGENT ERROR] this agent cannot spawn another one. \
+                             Do the work here."
+                                .to_string(),
+                        );
+                        continue;
+                    };
+
                     ui.show_status(&format!("subagent · {}", first_line(subtask)))
                         .await?;
                     if !reason.trim().is_empty() {
@@ -1183,30 +1244,39 @@ impl Agent {
                     }
 
                     let child = self.new_child_task(task, subtask).await;
-                    let child_id = child.task_id.clone();
-                    let started = std::time::Instant::now();
-                    let summary = self.run(ui, child).await?;
+                    let child_id = child.agent_id.clone();
+                    let shown_id = child_id.clone();
+                    let parent_task = task.task_id.clone();
+                    let errand = first_line(subtask);
+                    let errand_for_child = errand.clone();
 
-                    ui.show_status(&format!(
-                        "subagent · done in {:.1}s",
-                        started.elapsed().as_secs_f64()
-                    ))
-                    .await?;
+                    let caller = task.agent_id.clone();
+                    let caller_for_report = caller.clone();
+                    tokio::spawn(crate::skill_layer::CALLER.scope(caller, async move {
+                        let mut detached =
+                            crate::core::scheduler::subagent_ui(me.notifier_handle(), &child_id);
+                        let started = std::time::Instant::now();
+                        let outcome = me.run(&mut detached, child).await;
+                        let report = child_report(&errand_for_child, started.elapsed(), &outcome);
 
-                    self.memory
-                        .log(
-                            NewMessage::new(
-                                Role::System,
-                                format!("subagent {} finished: {}", child_id, summary),
-                            )
-                            .task(&task.task_id),
-                        )
-                        .await?;
+                        me.tell(format!("  · {}", first_line(&report)));
+                        me.leave_report(&caller_for_report, format!("[SUBAGENT] {}", report))
+                            .await;
+
+                        if let Err(e) = me
+                            .memory
+                            .log(NewMessage::new(Role::System, &report).task(&parent_task))
+                            .await
+                        {
+                            me.tell(format!("  x subagent · its report was not kept: {}", e));
+                        }
+                    }));
 
                     results.push(format!(
-                        "[SUBAGENT] the agent you spawned for '{}' reported:\n{}",
-                        first_line(subtask),
-                        summary
+                        "[SUBAGENT] {} is now working on '{}' on its own. Do not wait for it — \
+                         carry on, or answer the user. Its report reaches you on a later turn; \
+                         RequestData source 'agents' shows what it is doing meanwhile.",
+                        shown_id, errand
                     ));
                 }
 
@@ -2096,6 +2166,55 @@ fn own_messages(
         .collect()
 }
 
+fn queue_report(waiting: &mut Vec<(String, String)>, for_agent: &str, text: String) {
+    if waiting.len() >= REPORTS_KEPT {
+        waiting.remove(0);
+    }
+    waiting.push((for_agent.to_string(), text));
+}
+
+fn drain_reports(waiting: &mut Vec<(String, String)>, for_agent: &str) -> Vec<String> {
+    let mut mine = Vec::new();
+    waiting.retain(|(to, text)| {
+        if to == for_agent {
+            mine.push(text.clone());
+            false
+        } else {
+            true
+        }
+    });
+    mine
+}
+
+fn join_reports(existing: Option<String>, delivered: Vec<String>) -> String {
+    let arrived = delivered.join("\n");
+    match existing {
+        Some(text) if !text.trim().is_empty() => format!("{}\n{}", text, arrived),
+        _ => arrived,
+    }
+}
+
+fn child_report(
+    errand: &str,
+    took: std::time::Duration,
+    outcome: &JumabekResult<String>,
+) -> String {
+    match outcome {
+        Ok(summary) => format!(
+            "the agent you spawned for '{}' finished in {:.0}s and reported: {}",
+            errand,
+            took.as_secs_f64(),
+            summary.trim()
+        ),
+        Err(e) => format!(
+            "the agent you spawned for '{}' died after {:.0}s without finishing: {}",
+            errand,
+            took.as_secs_f64(),
+            e
+        ),
+    }
+}
+
 fn first_line(text: &str) -> String {
     text.lines()
         .next()
@@ -2149,6 +2268,156 @@ fn system_info() -> SystemInfo {
         jumabek_home: crate::configs::jumabek_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::*;
+
+    fn took() -> std::time::Duration {
+        std::time::Duration::from_secs(3)
+    }
+
+    #[test]
+    fn a_child_that_finished_reports_its_summary_and_nothing_else() {
+        let report = child_report(
+            "count the log files",
+            took(),
+            &Ok("  there are 41, of which 3 are empty  ".to_string()),
+        );
+
+        assert!(report.contains("count the log files"), "{report}");
+        assert!(
+            report.contains("there are 41, of which 3 are empty"),
+            "{report}"
+        );
+        assert!(report.contains("3s"), "{report}");
+    }
+
+    #[test]
+    fn a_child_that_died_says_so_instead_of_leaving_the_parent_waiting() {
+        let report = child_report(
+            "count the log files",
+            took(),
+            &Err(JumabekError::InternalError(
+                "the skill went away".to_string(),
+            )),
+        );
+
+        assert!(report.contains("without finishing"), "{report}");
+        assert!(report.contains("the skill went away"), "{report}");
+        assert!(
+            !report.contains("reported:"),
+            "a death was dressed up as a result: {report}"
+        );
+    }
+
+    #[test]
+    fn a_report_reaches_the_agent_that_spawned_the_child_and_nobody_else() {
+        let mut waiting = Vec::new();
+        queue_report(&mut waiting, "parent", "[SUBAGENT] mine".to_string());
+        queue_report(&mut waiting, "stranger", "[SUBAGENT] not yours".to_string());
+
+        assert_eq!(
+            drain_reports(&mut waiting, "parent"),
+            vec!["[SUBAGENT] mine"]
+        );
+        assert_eq!(
+            waiting.len(),
+            1,
+            "another agent's report was taken along with it"
+        );
+    }
+
+    #[test]
+    fn a_report_is_delivered_once_and_not_again_on_every_later_turn() {
+        let mut waiting = Vec::new();
+        queue_report(&mut waiting, "parent", "[SUBAGENT] done".to_string());
+
+        assert_eq!(drain_reports(&mut waiting, "parent").len(), 1);
+        assert!(
+            drain_reports(&mut waiting, "parent").is_empty(),
+            "the same report arrived twice"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_never_comes_back_cannot_grow_the_queue_without_end() {
+        let mut waiting = Vec::new();
+        for n in 0..REPORTS_KEPT + 5 {
+            queue_report(&mut waiting, "gone", format!("report {n}"));
+        }
+
+        assert_eq!(waiting.len(), REPORTS_KEPT);
+        assert_eq!(
+            waiting.last().map(|(_, text)| text.as_str()),
+            Some(format!("report {}", REPORTS_KEPT + 4).as_str()),
+            "the queue dropped the newest instead of the oldest"
+        );
+    }
+
+    #[test]
+    fn a_report_is_added_to_whatever_the_turn_already_had_to_say() {
+        let joined = join_reports(
+            Some("[SHELL] 41 files".to_string()),
+            vec!["[SUBAGENT] the other one finished".to_string()],
+        );
+
+        assert_eq!(
+            joined,
+            "[SHELL] 41 files\n[SUBAGENT] the other one finished"
+        );
+    }
+
+    #[test]
+    fn a_report_arriving_into_an_empty_turn_stands_on_its_own() {
+        assert_eq!(
+            join_reports(None, vec!["[SUBAGENT] done".to_string()]),
+            "[SUBAGENT] done"
+        );
+        assert_eq!(
+            join_reports(Some("   ".to_string()), vec!["[SUBAGENT] done".to_string()]),
+            "[SUBAGENT] done"
+        );
+    }
+
+    #[test]
+    fn several_children_finishing_at_once_all_get_through() {
+        let joined = join_reports(
+            None,
+            vec!["[SUBAGENT] one".to_string(), "[SUBAGENT] two".to_string()],
+        );
+
+        assert_eq!(
+            joined.lines().count(),
+            2,
+            "a report was swallowed: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_depth_limit_still_refuses_a_third_level() {
+        assert_eq!(
+            MAX_DEPTH, 2,
+            "the nesting limit moved without being decided"
+        );
+    }
+
+    #[test]
+    fn a_spawned_agent_is_told_it_may_not_ask_a_question() {
+        let mut ui = crate::core::scheduler::detached_ui();
+
+        let allowed = tokio_test_block(ui.ask_permission("rm -rf /", "", "high"));
+        assert!(!allowed, "a detached child granted itself permission");
+    }
+
+    fn tokio_test_block<F: std::future::Future<Output = JumabekResult<bool>>>(future: F) -> bool {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+            .expect("the detached ui should refuse, not fail")
     }
 }
 

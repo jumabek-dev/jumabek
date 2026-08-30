@@ -108,12 +108,8 @@ async fn main() -> JumabekResult<()> {
         .await?;
     }
 
-    let agent = Arc::new(Agent::new(
-        config.clone(),
-        memory,
-        registry,
-        mode.as_interface_mode(),
-    )?);
+    let agent = Agent::new(config.clone(), memory, registry, mode.as_interface_mode())?;
+    agent.notify_through(Arc::clone(&notifier) as Arc<dyn Notifier>);
 
     if let Some(task) = one_shot {
         let result = agent.handle(ui.as_mut(), task).await;
@@ -229,6 +225,20 @@ async fn main() -> JumabekResult<()> {
                 }
             }
         }
+    }
+
+    let dropped = agent.agents().running().await;
+    if !dropped.is_empty() {
+        ui.show_error(&format!(
+            "{} sub-agent(s) were still working and die with this process: {}",
+            dropped.len(),
+            dropped
+                .iter()
+                .map(|entry| entry.short_id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await?;
     }
 
     agent.memory().close().await?;
