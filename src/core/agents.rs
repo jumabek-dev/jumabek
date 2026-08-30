@@ -227,8 +227,17 @@ impl AgentRegistry {
     }
 }
 
-pub fn as_json(entries: &[AgentEntry]) -> String {
-    serde_json::json!({ "agents": entries }).to_string()
+pub fn as_json(
+    agents: &[AgentEntry],
+    groups: &[crate::core::board::Group],
+    board: &[crate::core::board::Entry],
+) -> String {
+    serde_json::json!({
+        "agents": agents,
+        "groups": groups,
+        "board": board,
+    })
+    .to_string()
 }
 
 pub fn as_text(entries: &[AgentEntry]) -> String {
@@ -470,9 +479,9 @@ mod tests {
     #[tokio::test]
     async fn the_endpoint_answers_with_valid_json_when_nothing_is_running() {
         let registry = AgentRegistry::new();
-        let body = as_json(&registry.snapshot().await);
+        let body = as_json(&registry.snapshot().await, &[], &[]);
 
-        assert_eq!(body, r#"{"agents":[]}"#);
+        assert_eq!(body, r#"{"agents":[],"board":[],"groups":[]}"#);
         serde_json::from_str::<serde_json::Value>(&body).expect("the body was not JSON");
     }
 
@@ -485,7 +494,7 @@ mod tests {
         sent.state = State::AwaitingPermission;
         sent.parent_id = Some("parent".to_string());
 
-        let body = as_json(std::slice::from_ref(&sent));
+        let body = as_json(std::slice::from_ref(&sent), &[], &[]);
         let back: serde_json::Value = serde_json::from_str(&body).expect("not JSON");
         let one = &back["agents"][0];
         let read: AgentEntry = serde_json::from_value(one.clone()).expect("unreadable entry");

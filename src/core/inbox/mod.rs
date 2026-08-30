@@ -21,6 +21,8 @@ const BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+const BOARD_SHOWN: usize = 40;
+
 pub struct Inbox {
     agent: Arc<Agent>,
     notifier: Arc<dyn Notifier>,
@@ -177,8 +179,7 @@ impl Inbox {
         }
 
         if parsed.method == "GET" && parsed.path == "/agents" {
-            let running = self.agent.agents().snapshot().await;
-            return Ok((200, crate::core::agents::as_json(&running)));
+            return Ok((200, self.what_is_running().await));
         }
 
         if parsed.method != "POST" {
@@ -248,6 +249,32 @@ impl Inbox {
                 "the task is still running; it was not abandoned".to_string(),
             )),
         }
+    }
+
+    async fn what_is_running(&self) -> String {
+        let agents = self.agent.agents().snapshot().await;
+        let board = self.agent.board();
+
+        let mut wanted: Vec<String> = agents
+            .iter()
+            .filter_map(|entry| entry.group_id.clone())
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+
+        let mut groups = Vec::new();
+        let mut entries = Vec::new();
+
+        for id in wanted {
+            if let Ok(Some(group)) = board.group(&id).await {
+                groups.push(group);
+            }
+            if let Ok(mut tail) = board.tail(&id, BOARD_SHOWN).await {
+                entries.append(&mut tail);
+            }
+        }
+
+        crate::core::agents::as_json(&agents, &groups, &entries)
     }
 
     async fn handle_notify(&self, accepted: Accepted) {

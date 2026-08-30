@@ -534,6 +534,10 @@ impl Agent {
         &self.memory
     }
 
+    pub fn board(&self) -> &crate::core::board::Board {
+        &self.board
+    }
+
     pub fn jobs(&self) -> &JobStore {
         &self.jobs
     }
@@ -1158,39 +1162,78 @@ impl Agent {
         why: &str,
         critical: bool,
     ) -> JumabekResult<String> {
-        if task.grant.is_none() {
-            return Ok(
-                "[RIGHTS] you are not working under a restricted grant; nothing is \
-                       being withheld from you."
-                    .to_string(),
-            );
-        }
-
-        if wanted.skills.is_empty() && !wanted.new_skills && !wanted.risky {
-            return Ok("[RIGHTS ERROR] name what you need".to_string());
-        }
-
         let ceiling = self.config.read().await.grants.ceiling.clone();
+        let verdict = decide_grant(
+            task.grant.as_ref(),
+            wanted,
+            &ceiling,
+            critical,
+            task.depth == 0,
+        );
 
-        if !wanted.within(&ceiling) {
-            self.audit(
-                &task.agent_id,
-                wanted,
-                why,
-                "refused above the ceiling",
-                "config",
-            )
-            .await;
-            return Ok(format!(
-                "[RIGHTS REFUSED] {} is above the ceiling set in config.toml, which nothing at \
-                 runtime can raise. The ceiling allows {}. Finish without it or report that you \
-                 could not.",
-                wanted.describe(),
-                ceiling.describe()
-            ));
+        if let Some((outcome, by)) = verdict.recorded() {
+            self.audit(&task.agent_id, wanted, why, outcome, by).await;
         }
 
-        if critical && task.depth == 0 {
+        match verdict {
+            Verdict::NotUnderGrant => {
+                return Ok(
+                    "[RIGHTS] you are not working under a restricted grant; nothing is \
+                     being withheld from you."
+                        .to_string(),
+                );
+            }
+
+            Verdict::NothingAsked => {
+                return Ok("[RIGHTS ERROR] name what you need".to_string());
+            }
+
+            Verdict::AboveCeiling => {
+                return Ok(format!(
+                    "[RIGHTS REFUSED] {} is above the ceiling set in config.toml, which nothing \
+                     at runtime can raise. The ceiling allows {}. Finish without it or report \
+                     that you could not.",
+                    wanted.describe(),
+                    ceiling.describe()
+                ));
+            }
+
+            Verdict::SentUpward => {
+                if let Some(parent) = self.parent_of(&task.agent_id).await {
+                    self.leave_report(
+                        &parent,
+                        format!(
+                            "[RIGHTS] {} needs {} and calls it critical: {}. Nobody was there \
+                             to ask. Decide it, or put it to the user.",
+                            short_id(&task.agent_id),
+                            wanted.describe(),
+                            why
+                        ),
+                    )
+                    .await;
+                }
+
+                return Ok(format!(
+                    "[RIGHTS QUEUED] nobody is at the keyboard, so {} has gone up to whoever \
+                     spawned you. Carry on with what you have; do not wait.",
+                    wanted.describe()
+                ));
+            }
+
+            Verdict::GrantedByMainAgent => {
+                self.widen_grant(task, wanted, "widened to").await;
+
+                return Ok(format!(
+                    "[RIGHTS] granted {} — it was inside the ceiling and you did not call it \
+                     critical. It applies from your next turn.",
+                    wanted.describe()
+                ));
+            }
+
+            Verdict::PutToTheUser => {}
+        }
+
+        {
             let allowed = ui
                 .ask_permission(
                     &format!("widen its own rights to {}", wanted.describe()),
@@ -1199,9 +1242,14 @@ impl Agent {
                 )
                 .await?;
 
-            let verdict = if allowed { "granted" } else { "refused" };
-            self.audit(&task.agent_id, wanted, why, verdict, "user")
-                .await;
+            self.audit(
+                &task.agent_id,
+                wanted,
+                why,
+                if allowed { "granted" } else { "refused" },
+                "user",
+            )
+            .await;
 
             if !allowed {
                 return Ok(format!(
@@ -1210,57 +1258,19 @@ impl Agent {
                 ));
             }
 
-            self.post_letter(Letter {
-                to: task.agent_id.clone(),
-                text: format!("[RIGHTS] the user granted {}", wanted.describe()),
-                narrow: None,
-                widen: Some(wanted.clone()),
-            })
-            .await;
-
-            return Ok(format!("[RIGHTS] granted {}", wanted.describe()));
+            self.widen_grant(task, wanted, "the user granted").await;
+            Ok(format!("[RIGHTS] granted {}", wanted.describe()))
         }
+    }
 
-        if critical {
-            self.audit(&task.agent_id, wanted, why, "left for the user", "queued")
-                .await;
-
-            if let Some(parent) = self.parent_of(&task.agent_id).await {
-                self.leave_report(
-                    &parent,
-                    format!(
-                        "[RIGHTS] {} needs {} and calls it critical: {}. Nobody was there to ask.                          Decide it, or put it to the user.",
-                        short_id(&task.agent_id),
-                        wanted.describe(),
-                        why
-                    ),
-                )
-                .await;
-            }
-
-            return Ok(format!(
-                "[RIGHTS QUEUED] nobody is at the keyboard, so {} has gone up to whoever spawned \
-                 you. Carry on with what you have; do not wait.",
-                wanted.describe()
-            ));
-        }
-
-        self.audit(&task.agent_id, wanted, why, "granted", "main agent")
-            .await;
-
+    async fn widen_grant(&self, task: &TaskObject, wanted: &Grant, said: &str) {
         self.post_letter(Letter {
             to: task.agent_id.clone(),
-            text: format!("[RIGHTS] widened to {}", wanted.describe()),
+            text: format!("[RIGHTS] {} {}", said, wanted.describe()),
             narrow: None,
             widen: Some(wanted.clone()),
         })
         .await;
-
-        Ok(format!(
-            "[RIGHTS] granted {} — it was inside the ceiling and you did not call it critical. \
-             It applies from your next turn.",
-            wanted.describe()
-        ))
     }
 
     async fn audit(&self, who: &str, wanted: &Grant, why: &str, verdict: &str, by: &str) {
@@ -2876,6 +2886,59 @@ fn child_report(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    NotUnderGrant,
+    NothingAsked,
+    AboveCeiling,
+    PutToTheUser,
+    SentUpward,
+    GrantedByMainAgent,
+}
+
+impl Verdict {
+    fn recorded(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Verdict::NotUnderGrant | Verdict::NothingAsked => None,
+            Verdict::AboveCeiling => Some(("refused above the ceiling", "config")),
+            Verdict::SentUpward => Some(("left for the user", "queued")),
+            Verdict::GrantedByMainAgent => Some(("granted", "main agent")),
+            Verdict::PutToTheUser => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn decides_anything(self) -> bool {
+        !matches!(self, Verdict::NotUnderGrant | Verdict::NothingAsked)
+    }
+}
+
+fn decide_grant(
+    under: Option<&Grant>,
+    wanted: &Grant,
+    ceiling: &Grant,
+    critical: bool,
+    someone_present: bool,
+) -> Verdict {
+    if under.is_none() {
+        return Verdict::NotUnderGrant;
+    }
+
+    if wanted.skills.is_empty() && !wanted.new_skills && !wanted.risky {
+        return Verdict::NothingAsked;
+    }
+
+    if !wanted.within(ceiling) {
+        return Verdict::AboveCeiling;
+    }
+
+    match (critical, someone_present) {
+        (true, true) => Verdict::PutToTheUser,
+        (true, false) => Verdict::SentUpward,
+        (false, _) => Verdict::GrantedByMainAgent,
+    }
+}
+
 fn discussion_key(group: &str, a: &str, b: &str) -> String {
     let (first, second) = if a <= b { (a, b) } else { (b, a) };
     format!("{}|{}|{}", group, first, second)
@@ -3172,6 +3235,114 @@ mod subagent_tests {
         let now = task.grant.expect("the grant went missing");
         assert_eq!(now.skills, vec!["telegram"]);
         assert!(!now.risky);
+    }
+
+    fn ceiling() -> Grant {
+        grant(&["*"], false, false)
+    }
+
+    #[test]
+    fn an_agent_under_no_grant_is_told_there_is_nothing_to_widen() {
+        let verdict = decide_grant(None, &grant(&["x"], false, false), &ceiling(), false, true);
+        assert_eq!(verdict, Verdict::NotUnderGrant);
+        assert!(!verdict.decides_anything());
+    }
+
+    #[test]
+    fn asking_for_nothing_in_particular_decides_nothing() {
+        let verdict = decide_grant(
+            Some(&grant(&["a"], false, false)),
+            &grant(&[], false, false),
+            &ceiling(),
+            false,
+            true,
+        );
+        assert_eq!(verdict, Verdict::NothingAsked);
+    }
+
+    #[test]
+    fn an_ordinary_request_inside_the_ceiling_is_settled_by_the_main_agent() {
+        assert_eq!(
+            decide_grant(
+                Some(&grant(&["a"], false, false)),
+                &grant(&["searxng_search"], false, false),
+                &ceiling(),
+                false,
+                true,
+            ),
+            Verdict::GrantedByMainAgent
+        );
+    }
+
+    #[test]
+    fn a_critical_request_waits_for_the_user_when_the_user_is_there() {
+        assert_eq!(
+            decide_grant(
+                Some(&grant(&["a"], false, false)),
+                &grant(&["searxng_search"], false, false),
+                &ceiling(),
+                true,
+                true,
+            ),
+            Verdict::PutToTheUser
+        );
+    }
+
+    #[test]
+    fn a_critical_request_with_nobody_at_the_keyboard_goes_up_instead_of_waiting() {
+        assert_eq!(
+            decide_grant(
+                Some(&grant(&["a"], false, false)),
+                &grant(&["searxng_search"], false, false),
+                &ceiling(),
+                true,
+                false,
+            ),
+            Verdict::SentUpward
+        );
+    }
+
+    #[test]
+    fn the_ceiling_refuses_whoever_is_asking_and_whoever_would_answer() {
+        for (critical, present) in [(false, true), (true, true), (true, false)] {
+            assert_eq!(
+                decide_grant(
+                    Some(&grant(&["a"], false, false)),
+                    &grant(&[], true, false),
+                    &ceiling(),
+                    critical,
+                    present,
+                ),
+                Verdict::AboveCeiling,
+                "the ceiling was got round with critical={critical} present={present}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_decision_leaves_a_record_of_who_made_it() {
+        for verdict in [
+            Verdict::NotUnderGrant,
+            Verdict::NothingAsked,
+            Verdict::AboveCeiling,
+            Verdict::PutToTheUser,
+            Verdict::SentUpward,
+            Verdict::GrantedByMainAgent,
+        ] {
+            if !verdict.decides_anything() {
+                assert!(verdict.recorded().is_none(), "{verdict:?}");
+                continue;
+            }
+
+            if verdict == Verdict::PutToTheUser {
+                continue;
+            }
+
+            let (outcome, by) = verdict
+                .recorded()
+                .unwrap_or_else(|| panic!("{verdict:?} decided something and wrote nothing down"));
+            assert!(!outcome.is_empty() && !by.is_empty(), "{verdict:?}");
+        }
     }
 
     #[test]

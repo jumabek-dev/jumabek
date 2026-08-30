@@ -5,6 +5,7 @@ mod doctor;
 mod error;
 mod interfaces;
 mod memory;
+mod panel;
 mod skill_layer;
 mod supervisor;
 mod token_counter;
@@ -523,15 +524,18 @@ async fn manage(command: &Manage) -> JumabekResult<()> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct AgentsAnswer {
-    agents: Vec<core::agents::AgentEntry>,
+struct Endpoint {
+    client: reqwest::Client,
+    url: String,
 }
 
-async fn ask_for_agents(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<Vec<core::agents::AgentEntry>, String> {
+impl panel::AsyncPoll for Endpoint {
+    async fn once(&mut self) -> Result<panel::Running, String> {
+        ask_for_agents(&self.client, &self.url).await
+    }
+}
+
+async fn ask_for_agents(client: &reqwest::Client, url: &str) -> Result<panel::Running, String> {
     let response = client
         .get(url)
         .send()
@@ -539,9 +543,8 @@ async fn ask_for_agents(
         .map_err(|e| format!("could not reach {}: {}", url, e))?;
 
     response
-        .json::<AgentsAnswer>()
+        .json::<panel::Running>()
         .await
-        .map(|answer| answer.agents)
         .map_err(|e| format!("{} answered something unreadable: {}", url, e))
 }
 
@@ -588,37 +591,15 @@ async fn watch_agents(port: u16, once: bool) -> JumabekResult<()> {
     let url = format!("http://127.0.0.1:{}/agents", port);
     let client = reqwest::Client::new();
 
-    let first = ask_for_agents(&client, &url)
-        .await
-        .map_err(|why| JumabekError::ConfigError(format!("{} — is jumabek running?", why)))?;
-
     if once {
-        draw_agents(&first);
+        let first = ask_for_agents(&client, &url)
+            .await
+            .map_err(|why| JumabekError::ConfigError(format!("{} — is jumabek running?", why)))?;
+        draw_agents(&first.agents);
         return Ok(());
     }
 
-    let mut latest = first;
-
-    loop {
-        print!("\x1b[2J\x1b[H");
-        println!("  watching {} · ctrl-c to stop", url);
-        draw_agents(&latest);
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!();
-                return Ok(());
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-        }
-
-        match ask_for_agents(&client, &url).await {
-            Ok(entries) => latest = entries,
-            Err(why) => {
-                println!("  {}", why);
-            }
-        }
-    }
+    panel::watch(url.clone(), Endpoint { client, url }).await
 }
 
 fn parse_command(input: &str) -> Command {

@@ -107,7 +107,7 @@ fn short(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: String,
     pub goal: String,
@@ -237,6 +237,14 @@ impl Board {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(rows)
+    }
+
+    pub async fn tail(&self, group_id: &str, limit: usize) -> JumabekResult<Vec<Entry>> {
+        let mut all = self.entries(group_id).await?;
+        if all.len() > limit {
+            all.drain(..all.len() - limit);
+        }
+        Ok(all)
     }
 
     pub async fn set_state(

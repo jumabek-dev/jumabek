@@ -465,6 +465,10 @@ jumabek remove <name>            # remove one
 jumabek jobs                     # list background jobs
 jumabek job-stop <id>            # stop and delete one
 
+jumabek agents                   # watch what its agents are doing, live
+jumabek agents --once            # print the same thing once and exit
+jumabek rights                   # who was granted what beyond config.toml
+
 jumabek inbox                    # is the door open, and who may knock
 jumabek profile                  # what it remembers about you
 jumabek forget-subject <who>     # make it forget one subject
