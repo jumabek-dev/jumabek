@@ -315,6 +315,7 @@ impl SkillModule for SkillRpcClient {
         let params = ExecuteParams {
             method: method.to_string(),
             args: args.to_string(),
+            caller: crate::skill_layer::current_caller(),
         };
         let encoded = serde_json::to_string(&params)
             .map_err(|e| SkillError::InvalidArgs(format!("cannot encode arguments: {}", e)))?;

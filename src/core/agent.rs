@@ -2,6 +2,7 @@ use chrono::Local;
 use jumabek_sdk::{SkillError, SkillOutput};
 
 use crate::configs::Config;
+use crate::core::agents::{AgentEntry, AgentRegistry, State as AgentState};
 use crate::core::context::ContextBuilder;
 use crate::core::intelligence::{Level, Reason, Standing};
 use crate::core::jobs::{JobStore, NewJob, Schedule, State};
@@ -21,6 +22,7 @@ use crate::memory::{Memory, NewMessage, Role};
 use crate::skill_layer::SkillRegistry;
 use crate::skill_layer::rpc_client::SkillRpcClient;
 use jumabek_sdk::SkillModule;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const INDEXED_CONTENT_LIMIT: usize = 2_000;
@@ -187,6 +189,8 @@ pub struct Agent {
     mode: RwLock<InterfaceMode>,
     intelligence: RwLock<Standing>,
     refund_iteration: RwLock<bool>,
+    session_id: String,
+    agents: Arc<AgentRegistry>,
 }
 
 enum StepOutcome {
@@ -227,6 +231,8 @@ impl Agent {
                 reason: None,
             }),
             refund_iteration: RwLock::new(false),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            agents: Arc::new(AgentRegistry::new()),
         })
     }
 
@@ -460,6 +466,7 @@ impl Agent {
     ) -> JumabekResult<String> {
         let mut detached = crate::core::scheduler::detached_ui();
         let mut job_task = self.new_task(&uuid::Uuid::new_v4().to_string(), task).await;
+        job_task.agent_id = format!("inbox:{}", origin.source);
         job_task.grant = Some(grant);
         job_task.origin = Some(origin);
         self.run(&mut detached, job_task).await
@@ -470,8 +477,10 @@ impl Agent {
         ui: &mut dyn UserInterface,
         task: String,
         grant: Grant,
+        job_id: i64,
     ) -> JumabekResult<String> {
         let mut job_task = self.new_task(&uuid::Uuid::new_v4().to_string(), task).await;
+        job_task.agent_id = format!("job:{}", job_id);
         job_task.grant = Some(grant);
         self.run(ui, job_task).await
     }
@@ -488,7 +497,44 @@ impl Agent {
         task: TaskObject,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = JumabekResult<String>> + Send + 'a>>
     {
-        Box::pin(self.run_loop(ui, task))
+        let caller = task.agent_id.clone();
+        let parent = crate::skill_layer::current_caller();
+        Box::pin(crate::skill_layer::CALLER.scope(caller, self.watched(ui, task, parent)))
+    }
+
+    async fn watched(
+        &self,
+        ui: &mut dyn UserInterface,
+        task: TaskObject,
+        parent: Option<String>,
+    ) -> JumabekResult<String> {
+        let agent_id = task.agent_id.clone();
+
+        self.agents
+            .register(
+                AgentEntry::new(&agent_id, &task.message)
+                    .under(parent, task.depth)
+                    .allowed(task.constraints.max_iterations),
+            )
+            .await;
+
+        let outcome = self.run_loop(ui, task).await;
+
+        self.agents
+            .finished(
+                &agent_id,
+                match outcome {
+                    Ok(_) => AgentState::Finished,
+                    Err(_) => AgentState::Failed,
+                },
+            )
+            .await;
+
+        outcome
+    }
+
+    pub fn agents(&self) -> Arc<AgentRegistry> {
+        Arc::clone(&self.agents)
     }
 
     async fn run_loop(
@@ -508,6 +554,8 @@ impl Agent {
 
         loop {
             task.intelligence = self.standing_for_task().await;
+            self.agents.iteration(&task.agent_id, task.iteration).await;
+            self.agents.doing(&task.agent_id, "thinking").await;
 
             let history = self.history_for(&task).await?;
             let profile = self.profile_block().await;
@@ -716,6 +764,7 @@ impl Agent {
 
         TaskObject {
             task_id: task_id.to_string(),
+            agent_id: self.session_id.clone(),
             parent_task_id: None,
             message: request,
             system_info: system_info(),
@@ -740,6 +789,7 @@ impl Agent {
         let mut child = self
             .new_task(&uuid::Uuid::new_v4().to_string(), request.to_string())
             .await;
+        child.agent_id = uuid::Uuid::new_v4().to_string();
         child.parent_task_id = Some(parent.task_id.clone());
         child.depth = parent.depth + 1;
         child.grant = parent.grant.clone();
@@ -866,6 +916,13 @@ impl Agent {
             }
 
             if let planner::Stage::Parallel(list) = stage {
+                self.agents
+                    .doing(
+                        &task.agent_id,
+                        &format!("{} steps at once", stage_actions(stage).len()),
+                    )
+                    .await;
+
                 match self.run_parallel(ui, task, list).await? {
                     Ok(mut batch) => results.append(&mut batch),
                     Err(outcome) => return Ok(outcome),
@@ -874,6 +931,8 @@ impl Agent {
             }
 
             let action = stage_actions(stage)[0];
+            self.agents.doing(&task.agent_id, &action.label()).await;
+
             match action {
                 ActionType::RespondToUser => {}
 
@@ -927,7 +986,9 @@ impl Agent {
                     description,
                     risk_level,
                 } => {
+                    self.agents.waiting(&task.agent_id, true).await;
                     let allowed = ui.ask_permission(action, description, risk_level).await?;
+                    self.agents.waiting(&task.agent_id, false).await;
                     let verdict = if allowed { "granted" } else { "denied" };
 
                     self.memory
@@ -951,6 +1012,7 @@ impl Agent {
                 }
 
                 ActionType::PromptToUser { message, options } => {
+                    self.agents.waiting(&task.agent_id, true).await;
                     let answer = if options.is_empty() {
                         ui.show_response(message).await?;
                         match ui.read_request().await? {
@@ -964,6 +1026,7 @@ impl Agent {
                     } else {
                         ui.prompt_choice(message, options).await?
                     };
+                    self.agents.waiting(&task.agent_id, false).await;
 
                     self.memory
                         .log(NewMessage::new(Role::User, &answer).task(&task.task_id))
@@ -995,9 +1058,21 @@ impl Agent {
                         continue;
                     }
 
+                    if source == "agents" {
+                        ui.show_status("agents").await?;
+
+                        let running = self.agents.others(&task.agent_id).await;
+
+                        results.push(format!(
+                            "[AGENTS] {}",
+                            crate::core::agents::as_text(&running)
+                        ));
+                        continue;
+                    }
+
                     if source != "memory" {
                         results.push(format!(
-                            "[ERROR] unknown data source '{}', only 'memory' and 'skill' are supported",
+                            "[ERROR] unknown data source '{}', only 'memory', 'skill' and 'agents' are supported",
                             source
                         ));
                         continue;
@@ -2176,6 +2251,7 @@ mod expansion_tests {
     fn task_with(parent: Option<&str>, grant: Option<Grant>) -> TaskObject {
         TaskObject {
             task_id: "t".to_string(),
+            agent_id: "a".to_string(),
             parent_task_id: parent.map(|p| p.to_string()),
             message: String::new(),
             system_info: system_info(),

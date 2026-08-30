@@ -176,6 +176,11 @@ impl Inbox {
             return Ok((200, http::json_message("status", "listening")));
         }
 
+        if parsed.method == "GET" && parsed.path == "/agents" {
+            let running = self.agent.agents().snapshot().await;
+            return Ok((200, crate::core::agents::as_json(&running)));
+        }
+
         if parsed.method != "POST" {
             return Err((405, "only POST is accepted".to_string()));
         }

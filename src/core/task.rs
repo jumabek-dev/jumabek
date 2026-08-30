@@ -107,6 +107,8 @@ pub struct Origin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskObject {
     pub task_id: String,
+    #[serde(skip)]
+    pub agent_id: String,
     pub parent_task_id: Option<String>,
     pub message: String,
     pub system_info: SystemInfo,
@@ -271,6 +273,44 @@ pub enum ActionType {
         #[serde(default, deserialize_with = "flexible_string")]
         language: String,
     },
+}
+
+impl ActionType {
+    pub fn label(&self) -> String {
+        match self {
+            ActionType::ExecuteModule { module, method, .. } => {
+                format!("skill · {}.{}", module, method)
+            }
+            ActionType::RespondToUser => "answering".to_string(),
+            ActionType::PermissionRequest { action, .. } => {
+                format!("asking permission · {}", action)
+            }
+            ActionType::PromptToUser { .. } => "asking the user".to_string(),
+            ActionType::RequestData { source, query, .. } => {
+                format!("{} · {}", source, query)
+            }
+            ActionType::RequestInboxKey { module, .. } => format!("inbox key · {}", module),
+            ActionType::Remember { subject, key, .. } => {
+                format!("remember · {} {}", subject, key)
+            }
+            ActionType::Forget { subject, .. } => format!("forget · {}", subject),
+            ActionType::ScheduleJob { name, .. } => format!("schedule · {}", name),
+            ActionType::ManageJobs { operation, .. } => format!("jobs · {}", operation),
+            ActionType::Switch { level, .. } => format!("intelligence · {}", level),
+            ActionType::SpawnAgent { .. } => "spawning a sub-agent".to_string(),
+            ActionType::GenerateChunk {
+                module_name,
+                chunk_index,
+                total_chunks,
+                ..
+            } => format!(
+                "writing {} · chunk {}/{}",
+                module_name,
+                chunk_index + 1,
+                total_chunks
+            ),
+        }
+    }
 }
 
 fn default_request_limit() -> u32 {

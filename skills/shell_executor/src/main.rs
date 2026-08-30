@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -11,10 +12,20 @@ const MAX_OUTPUT_CHARS: usize = 200_000;
 #[cfg(target_os = "windows")]
 const PS_OUTPUT_WIDTH: u32 = 4096;
 
+const NO_CALLER: &str = "__default__";
+
+fn caller_key() -> String {
+    jumabek_sdk::caller().unwrap_or_else(|| NO_CALLER.to_string())
+}
+
+fn process_default_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 #[derive(Debug)]
 pub struct ShellExecutor {
     pub metadata: ModuleMetadata,
-    virtual_cwd: Mutex<PathBuf>,
+    virtual_cwd: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl Default for ShellExecutor {
@@ -34,8 +45,17 @@ impl ShellExecutor {
                     process-tree kill, virtual cwd)"
                     .to_string(),
             },
-            virtual_cwd: Mutex::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            virtual_cwd: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cwd_of(&self, caller: &str) -> PathBuf {
+        self.virtual_cwd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(caller)
+            .cloned()
+            .unwrap_or_else(process_default_cwd)
     }
 
     fn try_intercept_cd(&self, cmd: &str) -> Option<Result<String, String>> {
@@ -64,26 +84,30 @@ impl ShellExecutor {
         let unquoted = strip_quotes(raw_arg);
         let expanded = expand_vars(unquoted);
 
-        let mut cwd = self.virtual_cwd.lock().unwrap_or_else(|e| e.into_inner());
+        let caller = caller_key();
+        let here = self.cwd_of(&caller);
 
         let target: PathBuf = if expanded.is_empty() {
             match home_dir() {
                 Some(h) => h,
-                None => cwd.clone(),
+                None => here.clone(),
             }
         } else {
             let p = Path::new(&expanded);
             if p.is_absolute() {
                 p.to_path_buf()
             } else {
-                cwd.join(p)
+                here.join(p)
             }
         };
 
         match target.canonicalize() {
             Ok(resolved) if resolved.is_dir() => {
                 let display = strip_unc(&resolved);
-                *cwd = resolved;
+                self.virtual_cwd
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(caller, resolved);
                 Some(Ok(format!("Changed directory to: {}", display)))
             }
             Ok(resolved) => Some(Err(format!("Not a directory: {}", resolved.display()))),
@@ -320,11 +344,7 @@ impl SkillModule for ShellExecutor {
             };
         }
 
-        let cwd = self
-            .virtual_cwd
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cwd = self.cwd_of(&caller_key());
 
         let mut command;
 
@@ -483,6 +503,47 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_caller_starts_from_the_process_directory() {
+        let skill = ShellExecutor::new();
+        assert_eq!(skill.cwd_of("agent-a"), process_default_cwd());
+        assert_eq!(skill.cwd_of("agent-b"), process_default_cwd());
+    }
+
+    #[test]
+    fn one_callers_cd_does_not_move_another() {
+        let skill = ShellExecutor::new();
+        let elsewhere = std::env::temp_dir().canonicalize().expect("temp dir");
+
+        skill
+            .virtual_cwd
+            .lock()
+            .unwrap()
+            .insert("agent-a".to_string(), elsewhere.clone());
+
+        assert_eq!(skill.cwd_of("agent-a"), elsewhere);
+        assert_eq!(
+            skill.cwd_of("agent-b"),
+            process_default_cwd(),
+            "one agent's cd relocated another"
+        );
+    }
+
+    #[test]
+    fn a_caller_that_sends_no_identity_gets_one_shared_directory() {
+        assert_eq!(caller_key(), NO_CALLER, "outside a call there is no caller");
+
+        let skill = ShellExecutor::new();
+        let elsewhere = std::env::temp_dir().canonicalize().expect("temp dir");
+        skill
+            .virtual_cwd
+            .lock()
+            .unwrap()
+            .insert(NO_CALLER.to_string(), elsewhere.clone());
+
+        assert_eq!(skill.cwd_of(NO_CALLER), elsewhere);
+    }
 
     #[test]
     fn a_pattern_kill_is_recognised_however_it_is_written() {

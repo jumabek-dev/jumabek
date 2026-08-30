@@ -336,6 +336,18 @@ async fn manage(command: &Manage) -> JumabekResult<()> {
             }
         }
 
+        Manage::Agents { once } => {
+            let (config, _) = Config::load()?;
+
+            if !config.inbox.enabled {
+                return Err(JumabekError::ConfigError(
+                    "watching agents needs the inbox open — set [inbox] enabled = true".to_string(),
+                ));
+            }
+
+            watch_agents(config.inbox.port, *once).await?;
+        }
+
         Manage::Inbox => {
             let (config, _) = Config::load()?;
             println!();
@@ -477,6 +489,104 @@ async fn manage(command: &Manage) -> JumabekResult<()> {
     }
 
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct AgentsAnswer {
+    agents: Vec<core::agents::AgentEntry>,
+}
+
+async fn ask_for_agents(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Vec<core::agents::AgentEntry>, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach {}: {}", url, e))?;
+
+    response
+        .json::<AgentsAnswer>()
+        .await
+        .map(|answer| answer.agents)
+        .map_err(|e| format!("{} answered something unreadable: {}", url, e))
+}
+
+fn draw_agents(entries: &[core::agents::AgentEntry]) {
+    println!();
+
+    if entries.is_empty() {
+        println!("  nothing running");
+        println!();
+        return;
+    }
+
+    println!(
+        "  {:<10} {:<19} {:>7} {:>6}  DOING",
+        "AGENT", "STATE", "ITER", "TIME"
+    );
+
+    for entry in entries {
+        let indent = "  ".repeat(entry.depth as usize);
+        println!(
+            "  {:<10} {:<19} {:>7} {:>5}s  {}{}",
+            entry.short_id(),
+            entry.state.id(),
+            format!("{}/{}", entry.iteration, entry.max_iterations),
+            entry.seconds,
+            indent,
+            entry.doing
+        );
+        println!("  {:<10} {}{}", "", indent, cut(&entry.task, 70));
+    }
+
+    println!();
+}
+
+fn cut(text: &str, limit: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(limit) {
+        Some((at, _)) => format!("{}…", &flat[..at]),
+        None => flat,
+    }
+}
+
+async fn watch_agents(port: u16, once: bool) -> JumabekResult<()> {
+    let url = format!("http://127.0.0.1:{}/agents", port);
+    let client = reqwest::Client::new();
+
+    let first = ask_for_agents(&client, &url)
+        .await
+        .map_err(|why| JumabekError::ConfigError(format!("{} — is jumabek running?", why)))?;
+
+    if once {
+        draw_agents(&first);
+        return Ok(());
+    }
+
+    let mut latest = first;
+
+    loop {
+        print!("\x1b[2J\x1b[H");
+        println!("  watching {} · ctrl-c to stop", url);
+        draw_agents(&latest);
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!();
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+
+        match ask_for_agents(&client, &url).await {
+            Ok(entries) => latest = entries,
+            Err(why) => {
+                println!("  {}", why);
+            }
+        }
+    }
 }
 
 fn parse_command(input: &str) -> Command {

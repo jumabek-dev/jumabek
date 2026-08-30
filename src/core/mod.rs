@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agents;
 pub mod chunks;
 pub mod context;
 pub mod inbox;

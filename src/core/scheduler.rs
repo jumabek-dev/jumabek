@@ -213,7 +213,7 @@ impl Scheduler {
 
         let outcome = self
             .agent
-            .run_job(&mut ui, task, job.grant.clone())
+            .run_job(&mut ui, task, job.grant.clone(), job.id)
             .await
             .unwrap_or_else(|e| format!("failed: {}", e));
 

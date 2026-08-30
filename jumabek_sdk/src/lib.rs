@@ -1,6 +1,14 @@
 pub mod protocol;
 pub mod runtime;
 
+tokio::task_local! {
+    pub(crate) static CALLER: Option<String>;
+}
+
+pub fn caller() -> Option<String> {
+    CALLER.try_with(|id| id.clone()).ok().flatten()
+}
+
 use core::fmt;
 
 use serde::{Deserialize, Serialize};

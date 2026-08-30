@@ -43,6 +43,10 @@ pub enum Manage {
     JobStop {
         id: i64,
     },
+    Agents {
+        #[arg(long)]
+        once: bool,
+    },
     Inbox,
     Profile,
     ForgetSubject {

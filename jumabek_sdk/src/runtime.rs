@@ -42,7 +42,11 @@ async fn dispatch<S: SkillModule>(
             Some(params) => match serde_json::from_str::<ExecuteParams>(&params) {
                 Ok(parameters) => {
                     if declared.contains(&parameters.method) {
-                        match skill.execute(&parameters.method, &parameters.args).await {
+                        let call = crate::CALLER.scope(
+                            parameters.caller.clone(),
+                            skill.execute(&parameters.method, &parameters.args),
+                        );
+                        match call.await {
                             Ok(output) => SkillResponsePayload::Output(output),
                             Err(error) => SkillResponsePayload::Error(error),
                         }
@@ -179,6 +183,15 @@ mod tests {
             0,
             "execute ran for a method the skill never declared"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_params_survive_a_request_that_names_no_caller() {
+        let old: ExecuteParams =
+            serde_json::from_str(r#"{"method":"count","args":"one two"}"#).expect("old shape");
+
+        assert_eq!(old.method, "count");
+        assert_eq!(old.caller, None, "a caller appeared where none was sent");
     }
 
     #[tokio::test]

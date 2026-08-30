@@ -5,6 +5,14 @@ pub mod metadata_cache;
 pub mod process_group;
 pub mod rpc_client;
 
+tokio::task_local! {
+    pub static CALLER: String;
+}
+
+pub fn current_caller() -> Option<String> {
+    CALLER.try_with(|id| id.clone()).ok()
+}
+
 use std::collections::HashMap;
 
 use jumabek_sdk::{ModuleMetadata, SkillModule};

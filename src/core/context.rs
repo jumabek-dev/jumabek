@@ -199,6 +199,7 @@ mod tests {
     fn task_object() -> TaskObject {
         TaskObject {
             task_id: "t-now".to_string(),
+            agent_id: "a".to_string(),
             parent_task_id: None,
             message: "открой doc.txt".to_string(),
             system_info: SystemInfo {

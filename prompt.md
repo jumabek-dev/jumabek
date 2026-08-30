@@ -145,9 +145,12 @@ and read aloud: short, no paths, no ids. Omit `options` for a free-form answer.
 ```
 {"type":"RequestData","source":"memory","query":"олжас телеграм контакт","limit":5}
 {"type":"RequestData","source":"skill","query":"rss_parser"}
+{"type":"RequestData","source":"agents","query":""}
 ```
 `memory` searches older sessions. `skill` asks what a skill can do; its methods then stay in
-your `skills` field for the rest of the session.
+your `skills` field for the rest of the session. `agents` lists the sub-agents running right
+now, what each is working on and how far in it is — you are never in that list yourself, and
+one that has finished is gone from it.
 
 **5. Remember** — keep something worth knowing next time.
 ```
