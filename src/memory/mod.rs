@@ -257,6 +257,32 @@ impl Memory {
         Ok(id)
     }
 
+    pub async fn thread(&self, key: &str, limit: u32) -> JumabekResult<Vec<StoredMessage>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, role, content, raw_json
+               FROM messages
+              WHERE parent_task_id = ?1
+              ORDER BY id DESC
+              LIMIT ?2",
+        )?;
+
+        let mut rows = stmt
+            .query_map(params![key, limit], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    raw_json: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.reverse();
+        Ok(rows)
+    }
+
     pub async fn current_session(&self) -> JumabekResult<Vec<StoredMessage>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(

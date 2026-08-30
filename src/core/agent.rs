@@ -32,6 +32,8 @@ const SKILL_METHOD_BUDGET: usize = 2_000;
 
 const REPORTS_KEPT: usize = 20;
 
+const THREAD_MESSAGES: u32 = 60;
+
 const PARSE_RETRIES: u32 = 2;
 
 const PARSE_CORRECTION: &str = "Your previous answer could not be read as an agent response and \
@@ -557,6 +559,7 @@ impl Agent {
         let mut detached = crate::core::scheduler::detached_ui();
         let mut job_task = self.new_task(&uuid::Uuid::new_v4().to_string(), task).await;
         job_task.agent_id = format!("inbox:{}", origin.source);
+        job_task.parent_task_id = Some(thread_key(&origin));
         job_task.grant = Some(grant);
         job_task.origin = Some(origin);
         self.run(&mut detached, job_task).await
@@ -800,6 +803,13 @@ impl Agent {
         &self,
         task: &TaskObject,
     ) -> JumabekResult<Vec<crate::memory::StoredMessage>> {
+        if let Some(origin) = &task.origin {
+            return self
+                .memory
+                .thread(&thread_key(origin), THREAD_MESSAGES)
+                .await;
+        }
+
         let history = self.memory.current_session().await?;
 
         if reads_the_whole_session(task) {
@@ -2954,6 +2964,14 @@ fn refuse_outside_grant(task: &TaskObject, action: &ActionType) -> Option<String
     }
 }
 
+fn thread_key(origin: &Origin) -> String {
+    format!(
+        "inbox:{}:{}",
+        origin.source.trim().to_lowercase(),
+        origin.who.trim().to_lowercase()
+    )
+}
+
 fn reads_the_whole_session(task: &TaskObject) -> bool {
     task.parent_task_id.is_none() && task.grant.is_none()
 }
@@ -3680,6 +3698,49 @@ mod expansion_tests {
             intelligence: None,
             interface_mode: InterfaceMode::Cli,
         }
+    }
+
+    fn origin(source: &str, who: &str) -> Origin {
+        Origin {
+            source: source.to_string(),
+            who: who.to_string(),
+        }
+    }
+
+    #[test]
+    fn one_person_writing_from_one_place_always_lands_in_the_same_thread() {
+        assert_eq!(
+            thread_key(&origin("telegram", "Айбар")),
+            thread_key(&origin("Telegram", " айбар ")),
+            "the same person got two threads because of casing"
+        );
+    }
+
+    #[test]
+    fn two_people_writing_from_the_same_place_do_not_share_a_thread() {
+        assert_ne!(
+            thread_key(&origin("telegram", "айбар")),
+            thread_key(&origin("telegram", "олжас")),
+            "one person could read another's conversation"
+        );
+    }
+
+    #[test]
+    fn the_same_name_on_two_services_is_two_threads() {
+        assert_ne!(
+            thread_key(&origin("telegram", "айбар")),
+            thread_key(&origin("whatsapp", "айбар"))
+        );
+    }
+
+    #[test]
+    fn a_thread_key_never_collides_with_a_task_id() {
+        let key = thread_key(&origin("telegram", "айбар"));
+        assert!(key.starts_with("inbox:"), "{key}");
+        assert!(
+            uuid::Uuid::parse_str(&key).is_err(),
+            "a thread key could be mistaken for a task id"
+        );
     }
 
     #[test]

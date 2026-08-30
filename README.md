@@ -261,17 +261,84 @@ window with output whose only useful part is the conclusion.
 
 So JumaBek can hand a piece of work to a copy of itself. The copy starts empty — the system
 prompt, the skills, and a task written as a standalone instruction. It cannot see the
-conversation it came from, which is the entire point. It runs its own loop and returns one
-summary.
+conversation it came from, which is the entire point.
+
+**Spawning returns immediately.** The copy runs on its own while the conversation carries on,
+and its summary — never its transcript — arrives on a later turn, often after you have
+already been answered.
 
 ```
+  ▌ Handing that off.
   · subagent · read every .log under C:/logs and list the error codes
-  · shell_executor · execute_command
-  · subagent · done in 12.4s
+  ▌ Handed off; I am free again.
+  · the agent you spawned for 'read every .log' finished in 12s and reported: 41 files,
+    three distinct codes
 ```
 
-Nesting stops at two levels. Below that, a tree is almost always a task that failed to
-decompose and started looping on itself.
+Nobody is at the keyboard on the copy's side, so it cannot ask a question or ask permission;
+anything it tries is refused. Give it work it can finish alone. Nesting stops at two levels —
+below that, a tree is almost always a task that failed to decompose.
+
+If it dies, that is reported as a death rather than dressed up as a result. If you quit while
+one is still working, you are told how many were dropped.
+
+### Roles, groups and a board
+
+A role is three things named in `config.toml`: a short brief, a list of skills, and what it
+may do.
+
+```toml
+[roles.researcher]
+prompt = "You find things out and report what you actually saw. You never guess."
+skills = ["searxng_search", "shell_executor"]
+```
+
+Spawning can name one. The copy's rights are then the parent's **narrowed by** the role's —
+never the union. Without that, an agent with no shell access could launder its way to a shell
+by asking a peer, and nothing in the record would show a permission was ever granted.
+
+Everything spawned from one task shares a group: one goal, one board, and one pot of
+iterations for all of them together. The shared pot is not decoration — three agents each
+comfortably under their own limit will otherwise pass work between themselves indefinitely.
+When it runs out the whole group stops and writes down that it did.
+
+The board is a SQLite table scoped to that group, and it is the single record: a conclusion
+that was not written to the board did not happen. Entries are a task, a finding, a decision
+or a question, addressed to an agent, a role or everyone. Agents can also message each other
+directly, bounded by a fixed number of turns per pair; when those run out the exchange closes,
+a decision goes to the board, and the disagreement goes up to whoever spawned them.
+
+### Watching it work
+
+```console
+$ jumabek agents
+```
+
+Three panes in a second terminal: agents on the left coloured by state, their group's board
+on the right, and how much of the shared budget is gone along the bottom. Arrow keys pick an
+agent and the other two follow it. `--once` prints a plain table and exits, for scripts.
+
+It reads a token-free endpoint on the same loopback port, so nothing new is exposed.
+
+### Asking for more rights
+
+An agent that runs into something outside its grant does not just fail. It can ask, naming
+what it needs and why — a person may be reading that sentence hours later.
+
+A request inside the ceiling in `config.toml` and not marked critical is settled by the main
+agent at once. A critical one goes to you if you are there, and up to whoever spawned it if
+you are not. Nothing at runtime can raise the ceiling; that takes editing the file and
+restarting, which is what stops privilege accumulating one justified step at a time.
+
+Every verdict is written down against whoever asked:
+
+```console
+$ jumabek rights
+  2026-08-30T08:27:11Z · inbox:te wanted searxng_search · granted by main agent · the answer
+                          is only on the web
+  2026-08-30T08:27:11Z · inbox:te wanted may write new skills · refused above the ceiling by
+                          config · I would like to write a skill
+```
 
 ### Background jobs
 
