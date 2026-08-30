@@ -70,6 +70,9 @@ fn short_name(action: &ActionType) -> &str {
         ActionType::ManageJobs { .. } => "jobs",
         ActionType::GenerateChunk { .. } => "chunk",
         ActionType::Switch { .. } => "switch",
+        ActionType::PostToBoard { .. } => "board",
+        ActionType::AskAgent { .. } => "ask agent",
+        ActionType::RequestGrant { .. } => "rights",
     }
 }
 

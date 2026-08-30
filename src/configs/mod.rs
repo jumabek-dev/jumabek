@@ -19,6 +19,10 @@ pub struct Config {
     pub inbox: InboxSection,
     #[serde(default)]
     pub skills: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, RoleSection>,
+    #[serde(default)]
+    pub grants: GrantsSection,
 
     #[serde(skip)]
     pub system_prompt: String,
@@ -28,6 +32,50 @@ pub struct Config {
     pub api_key: String,
     #[serde(skip)]
     pub level_api_keys: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleSection {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub new_skills: bool,
+    #[serde(default)]
+    pub risky: bool,
+}
+
+impl RoleSection {
+    pub fn grant(&self) -> crate::core::task::Grant {
+        crate::core::task::Grant {
+            skills: self.skills.clone(),
+            new_skills: self.new_skills,
+            risky: self.risky,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantsSection {
+    #[serde(default = "default_ceiling")]
+    pub ceiling: crate::core::task::Grant,
+}
+
+impl Default for GrantsSection {
+    fn default() -> Self {
+        GrantsSection {
+            ceiling: default_ceiling(),
+        }
+    }
+}
+
+fn default_ceiling() -> crate::core::task::Grant {
+    crate::core::task::Grant {
+        skills: vec!["*".to_string()],
+        new_skills: false,
+        risky: false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +210,18 @@ pub struct AgentSection {
     pub language: String,
     #[serde(default = "default_carry_over")]
     pub carry_over_messages: u32,
+    #[serde(default = "default_group_budget")]
+    pub group_iteration_budget: u32,
+    #[serde(default = "default_discussion_budget")]
+    pub discussion_turns: u32,
+}
+
+fn default_group_budget() -> u32 {
+    40
+}
+
+fn default_discussion_budget() -> u32 {
+    6
 }
 
 fn default_carry_over() -> u32 {

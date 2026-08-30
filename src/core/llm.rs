@@ -765,7 +765,7 @@ mod tests {
             );
             let parsed = parse_agent_response(&content).unwrap();
             match &parsed.actions[0] {
-                ActionType::SpawnAgent { task, reason } => {
+                ActionType::SpawnAgent { task, reason, .. } => {
                     assert_eq!(task, "read the logs");
                     assert_eq!(reason, "long");
                 }

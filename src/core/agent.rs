@@ -44,7 +44,7 @@ const STALL_CORRECTION: &str = "Your last answer said is_done: false but sent no
      action. Either send a real action (ExecuteModule, PromptToUser, SpawnAgent, ...) this turn, \
      or set is_done: true if you are actually finished.";
 
-const CAPABILITIES: [&str; 13] = [
+const CAPABILITIES: [&str; 16] = [
     "ExecuteModule",
     "PermissionRequest",
     "PromptToUser",
@@ -53,6 +53,9 @@ const CAPABILITIES: [&str; 13] = [
     "Forget",
     "RequestInboxKey",
     "SpawnAgent",
+    "PostToBoard",
+    "AskAgent",
+    "RequestGrant",
     "ScheduleJob",
     "ManageJobs",
     "GenerateChunk",
@@ -196,7 +199,29 @@ pub struct Agent {
     agents: Arc<AgentRegistry>,
     me: std::sync::OnceLock<std::sync::Weak<Agent>>,
     notifier: std::sync::RwLock<Arc<dyn Notifier>>,
-    reports: RwLock<Vec<(String, String)>>,
+    reports: RwLock<Vec<Letter>>,
+    board: crate::core::board::Board,
+    discussions: RwLock<std::collections::HashMap<String, u32>>,
+    memberships: RwLock<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Letter {
+    pub to: String,
+    pub text: String,
+    pub narrow: Option<Grant>,
+    pub widen: Option<Grant>,
+}
+
+impl Letter {
+    fn plain(to: &str, text: String) -> Letter {
+        Letter {
+            to: to.to_string(),
+            text,
+            narrow: None,
+            widen: None,
+        }
+    }
 }
 
 enum StepOutcome {
@@ -216,6 +241,7 @@ impl Agent {
         let context =
             ContextBuilder::new(config.system_prompt.clone(), config.llm.context_token_limit);
         let jobs = JobStore::open(&config.db_path())?;
+        let board = crate::core::board::Board::open(&config.db_path())?;
         let starting = config.llm.intelligence.starting_level();
         let starting_model = model_for(&config, starting);
 
@@ -242,6 +268,9 @@ impl Agent {
             me: std::sync::OnceLock::new(),
             notifier: std::sync::RwLock::new(Arc::new(crate::core::scheduler::PlainNotifier)),
             reports: RwLock::new(Vec::new()),
+            board,
+            discussions: RwLock::new(std::collections::HashMap::new()),
+            memberships: RwLock::new(std::collections::HashMap::new()),
         });
 
         let _ = agent.me.set(Arc::downgrade(&agent));
@@ -267,11 +296,15 @@ impl Agent {
     }
 
     async fn leave_report(&self, for_agent: &str, text: String) {
-        let mut waiting = self.reports.write().await;
-        queue_report(&mut waiting, for_agent, text);
+        self.post_letter(Letter::plain(for_agent, text)).await;
     }
 
-    async fn take_reports(&self, for_agent: &str) -> Vec<String> {
+    async fn post_letter(&self, letter: Letter) {
+        let mut waiting = self.reports.write().await;
+        queue_report(&mut waiting, letter);
+    }
+
+    async fn take_reports(&self, for_agent: &str) -> Vec<Letter> {
         let mut waiting = self.reports.write().await;
         drain_reports(&mut waiting, for_agent)
     }
@@ -561,6 +594,10 @@ impl Agent {
             .register(
                 AgentEntry::new(&agent_id, &task.message)
                     .under(parent, task.depth)
+                    .belonging(
+                        task.group.as_ref().map(|group| group.id.clone()),
+                        task.role.clone(),
+                    )
                     .allowed(task.constraints.max_iterations),
             )
             .await;
@@ -604,13 +641,26 @@ impl Agent {
             self.agents.iteration(&task.agent_id, task.iteration).await;
             self.agents.doing(&task.agent_id, "thinking").await;
 
+            if task.group.is_none()
+                && let Some(id) = self.group_of(&task.agent_id).await
+            {
+                task.group = self.group_view(&id).await;
+            }
+
             let delivered = self.take_reports(&task.agent_id).await;
             if !delivered.is_empty() {
-                task.system_response = Some(join_reports(task.system_response.take(), delivered));
+                apply_letters(&mut task, &delivered);
+                let text = delivered.iter().map(|l| l.text.clone()).collect();
+                task.system_response = Some(join_reports(task.system_response.take(), text));
+            }
+
+            if let Some(stop) = self.spend_group_iteration(&mut task).await {
+                ui.show_status(&stop).await?;
+                return Ok(stop);
             }
 
             let history = self.history_for(&task).await?;
-            let profile = self.profile_block().await;
+            let profile = self.profile_block(&task).await;
             let level = self.level().await;
             let (context, token_limit) = {
                 let config = self.config.read().await;
@@ -725,9 +775,26 @@ impl Agent {
         Ok(own_messages(history, &task.task_id))
     }
 
-    async fn profile_block(&self) -> String {
+    async fn profile_block(&self, task: &TaskObject) -> String {
         let facts = self.memory.known_facts().await.unwrap_or_default();
-        profile::block(&facts, &profile::read_notes())
+        let block = profile::block(&facts, &profile::read_notes());
+
+        let fragment = self.role_prompt(task.role.as_ref()).await;
+        if fragment.trim().is_empty() {
+            return block;
+        }
+
+        let named = format!(
+            "You are working as the {}.\n{}",
+            task.role.as_deref().unwrap_or("agent"),
+            fragment.trim()
+        );
+
+        if block.is_empty() {
+            named
+        } else {
+            format!("{}\n\n{}", block, named)
+        }
     }
 
     async fn ask_for_more_iterations(
@@ -830,6 +897,8 @@ impl Agent {
             iteration: 0,
             fix_iteration: 0,
             depth: 0,
+            role: None,
+            group: None,
             grant: None,
             origin: None,
             intelligence: None,
@@ -837,15 +906,469 @@ impl Agent {
         }
     }
 
-    async fn new_child_task(&self, parent: &TaskObject, request: &str) -> TaskObject {
+    async fn new_child_task(
+        &self,
+        parent: &TaskObject,
+        request: &str,
+        role: &str,
+        group_id: Option<String>,
+    ) -> TaskObject {
         let mut child = self
             .new_task(&uuid::Uuid::new_v4().to_string(), request.to_string())
             .await;
         child.agent_id = uuid::Uuid::new_v4().to_string();
         child.parent_task_id = Some(parent.task_id.clone());
         child.depth = parent.depth + 1;
-        child.grant = parent.grant.clone();
+
+        child.grant = match self.role_grant(role).await {
+            Some(from_role) => Some(match &parent.grant {
+                Some(inherited) => inherited.narrow(&from_role),
+                None => from_role,
+            }),
+            None => parent.grant.clone(),
+        };
+
+        if !role.trim().is_empty() {
+            child.role = Some(role.trim().to_string());
+        }
+
+        if let Some(id) = group_id {
+            self.join_group(&child.agent_id, &id).await;
+            child.group = self.group_view(&id).await;
+        }
+
         child
+    }
+
+    async fn spend_group_iteration(&self, task: &mut TaskObject) -> Option<String> {
+        let id = task.group.as_ref()?.id.clone();
+
+        let group = match self.board.spend(&id).await {
+            Ok(Some(group)) => group,
+            Ok(None) => return None,
+            Err(e) => {
+                self.tell(format!("  x board · {}", e));
+                return None;
+            }
+        };
+
+        if let Some(view) = task.group.as_mut() {
+            view.iterations_left = group.left();
+        }
+
+        if !group.exhausted() {
+            return None;
+        }
+
+        let first = self.board.close_group(&id).await.unwrap_or(false);
+        self.leave_group(&task.agent_id).await;
+        task.group = None;
+
+        if first {
+            let _ = self
+                .board
+                .post(
+                    &id,
+                    &task.agent_id,
+                    crate::core::board::EVERYONE,
+                    crate::core::board::Kind::Decision,
+                    &format!(
+                        "the group ran out of its shared {} iterations and was stopped",
+                        group.budget
+                    ),
+                )
+                .await;
+        }
+
+        Some(format!(
+            "the group working on '{}' used all {} of its shared iterations and was stopped. \
+             Whatever is on the board is what it got.",
+            first_line(&group.goal),
+            group.budget
+        ))
+    }
+
+    async fn use_board(
+        &self,
+        task: &TaskObject,
+        kind: &str,
+        to: &str,
+        body: &str,
+        entry: i64,
+        state: &str,
+    ) -> String {
+        let Some(group) = &task.group else {
+            return "[BOARD ERROR] you are not working in a group, so there is no board. \
+                    Spawn an agent to open one."
+                .to_string();
+        };
+
+        if entry > 0 {
+            let Some(wanted) = crate::core::board::EntryState::parse(state) else {
+                return format!(
+                    "[BOARD ERROR] '{}' is not a state. Use claimed or done.",
+                    state
+                );
+            };
+
+            return match self.board.set_state(&group.id, entry, wanted).await {
+                Ok(true) => format!("[BOARD] #{} is now {}", entry, wanted.as_str()),
+                Ok(false) => format!(
+                    "[BOARD ERROR] there is no entry #{} on your group's board",
+                    entry
+                ),
+                Err(e) => format!("[BOARD ERROR] {}", e),
+            };
+        }
+
+        if body.trim().is_empty() {
+            return "[BOARD ERROR] an entry needs a body".to_string();
+        }
+
+        let Some(wanted) = crate::core::board::Kind::parse(kind) else {
+            return format!(
+                "[BOARD ERROR] '{}' is not a kind. Use task, finding, decision or question.",
+                kind
+            );
+        };
+
+        let addressee = if to.trim().is_empty() {
+            crate::core::board::EVERYONE
+        } else {
+            to.trim()
+        };
+
+        match self
+            .board
+            .post(&group.id, &task.agent_id, addressee, wanted, body)
+            .await
+        {
+            Ok(id) => format!("[BOARD] wrote #{} as a {}", id, wanted.as_str()),
+            Err(e) => format!("[BOARD ERROR] {}", e),
+        }
+    }
+
+    async fn ask_agent(&self, task: &TaskObject, to: &str, message: &str) -> String {
+        let Some(group) = &task.group else {
+            return "[ASK ERROR] you can only talk to agents in your own group, and you are \
+                    not in one."
+                .to_string();
+        };
+
+        if message.trim().is_empty() {
+            return "[ASK ERROR] say something".to_string();
+        }
+
+        let members = self.agents.snapshot().await;
+        let Some(target) = members.iter().find(|entry| {
+            entry.group_id.as_deref() == Some(group.id.as_str())
+                && entry.agent_id != task.agent_id
+                && (entry.agent_id == to.trim() || entry.role.as_deref() == Some(to.trim()))
+        }) else {
+            return format!(
+                "[ASK ERROR] nobody called '{}' is in your group. In it right now: {}",
+                to,
+                if group.members.is_empty() {
+                    "only you".to_string()
+                } else {
+                    group.members.join(", ")
+                }
+            );
+        };
+
+        let pair = discussion_key(&group.id, &task.agent_id, &target.agent_id);
+        let allowed = self.config.read().await.agent.discussion_turns;
+        let spent = {
+            let mut talking = self.discussions.write().await;
+            let count = talking.entry(pair).or_insert(0);
+            *count += 1;
+            *count
+        };
+
+        if spent > allowed {
+            let _ = self
+                .board
+                .post(
+                    &group.id,
+                    &task.agent_id,
+                    crate::core::board::EVERYONE,
+                    crate::core::board::Kind::Decision,
+                    &format!(
+                        "the exchange with {} was closed after {} turns without agreement;                          it goes to whoever spawned us",
+                        short_id(&target.agent_id),
+                        allowed
+                    ),
+                )
+                .await;
+
+            if let Some(parent) = &target.parent_id {
+                self.leave_report(
+                    parent,
+                    format!(
+                        "[GROUP] {} and {} talked past each other for {} turns and were stopped.                          The disagreement is yours to settle; their board has the record.",
+                        short_id(&task.agent_id),
+                        short_id(&target.agent_id),
+                        allowed
+                    ),
+                )
+                .await;
+            }
+
+            return format!(
+                "[ASK REFUSED] you and {} have used all {} turns of this exchange. It is closed, \
+                 a decision is on the board and it has gone up to whoever spawned you. Work with \
+                 what you have.",
+                short_id(&target.agent_id),
+                allowed
+            );
+        }
+
+        self.post_letter(Letter {
+            to: target.agent_id.clone(),
+            text: format!(
+                "[FROM {}{}] {}\nAnswer with AskAgent to '{}' if it needs an answer, and put \
+                 anything the group should keep on the board.",
+                short_id(&task.agent_id),
+                match &task.role {
+                    Some(role) => format!(" the {}", role),
+                    None => String::new(),
+                },
+                message.trim(),
+                task.agent_id
+            ),
+            narrow: task.grant.clone(),
+            widen: None,
+        })
+        .await;
+
+        format!(
+            "[ASK] sent to {}. Its answer reaches you on a later turn; {} of {} turns of this \
+             exchange are left. It works under your rights as well as its own while it answers.",
+            short_id(&target.agent_id),
+            allowed.saturating_sub(spent),
+            allowed
+        )
+    }
+
+    async fn expand_grant(
+        &self,
+        ui: &mut dyn UserInterface,
+        task: &TaskObject,
+        wanted: &Grant,
+        why: &str,
+        critical: bool,
+    ) -> JumabekResult<String> {
+        if task.grant.is_none() {
+            return Ok(
+                "[RIGHTS] you are not working under a restricted grant; nothing is \
+                       being withheld from you."
+                    .to_string(),
+            );
+        }
+
+        if wanted.skills.is_empty() && !wanted.new_skills && !wanted.risky {
+            return Ok("[RIGHTS ERROR] name what you need".to_string());
+        }
+
+        let ceiling = self.config.read().await.grants.ceiling.clone();
+
+        if !wanted.within(&ceiling) {
+            self.audit(
+                &task.agent_id,
+                wanted,
+                why,
+                "refused above the ceiling",
+                "config",
+            )
+            .await;
+            return Ok(format!(
+                "[RIGHTS REFUSED] {} is above the ceiling set in config.toml, which nothing at \
+                 runtime can raise. The ceiling allows {}. Finish without it or report that you \
+                 could not.",
+                wanted.describe(),
+                ceiling.describe()
+            ));
+        }
+
+        if critical && task.depth == 0 {
+            let allowed = ui
+                .ask_permission(
+                    &format!("widen its own rights to {}", wanted.describe()),
+                    why,
+                    "high",
+                )
+                .await?;
+
+            let verdict = if allowed { "granted" } else { "refused" };
+            self.audit(&task.agent_id, wanted, why, verdict, "user")
+                .await;
+
+            if !allowed {
+                return Ok(format!(
+                    "[RIGHTS REFUSED] the user said no to {}. Finish without it.",
+                    wanted.describe()
+                ));
+            }
+
+            self.post_letter(Letter {
+                to: task.agent_id.clone(),
+                text: format!("[RIGHTS] the user granted {}", wanted.describe()),
+                narrow: None,
+                widen: Some(wanted.clone()),
+            })
+            .await;
+
+            return Ok(format!("[RIGHTS] granted {}", wanted.describe()));
+        }
+
+        if critical {
+            self.audit(&task.agent_id, wanted, why, "left for the user", "queued")
+                .await;
+
+            if let Some(parent) = self.parent_of(&task.agent_id).await {
+                self.leave_report(
+                    &parent,
+                    format!(
+                        "[RIGHTS] {} needs {} and calls it critical: {}. Nobody was there to ask.                          Decide it, or put it to the user.",
+                        short_id(&task.agent_id),
+                        wanted.describe(),
+                        why
+                    ),
+                )
+                .await;
+            }
+
+            return Ok(format!(
+                "[RIGHTS QUEUED] nobody is at the keyboard, so {} has gone up to whoever spawned \
+                 you. Carry on with what you have; do not wait.",
+                wanted.describe()
+            ));
+        }
+
+        self.audit(&task.agent_id, wanted, why, "granted", "main agent")
+            .await;
+
+        self.post_letter(Letter {
+            to: task.agent_id.clone(),
+            text: format!("[RIGHTS] widened to {}", wanted.describe()),
+            narrow: None,
+            widen: Some(wanted.clone()),
+        })
+        .await;
+
+        Ok(format!(
+            "[RIGHTS] granted {} — it was inside the ceiling and you did not call it critical. \
+             It applies from your next turn.",
+            wanted.describe()
+        ))
+    }
+
+    async fn audit(&self, who: &str, wanted: &Grant, why: &str, verdict: &str, by: &str) {
+        if let Err(e) = self
+            .board
+            .audit(who, &wanted.describe(), why, verdict, by)
+            .await
+        {
+            self.tell(format!("  x rights · the record was not written: {}", e));
+        }
+    }
+
+    async fn parent_of(&self, agent_id: &str) -> Option<String> {
+        self.agents
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|entry| entry.agent_id == agent_id)
+            .and_then(|entry| entry.parent_id)
+    }
+
+    async fn role_exists(&self, name: &str) -> bool {
+        self.config.read().await.roles.contains_key(name)
+    }
+
+    async fn role_names(&self) -> String {
+        let config = self.config.read().await;
+        if config.roles.is_empty() {
+            return "none are configured".to_string();
+        }
+        config.roles.keys().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    async fn role_grant(&self, name: &str) -> Option<Grant> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.config.read().await.roles.get(name).map(|r| r.grant())
+    }
+
+    async fn role_prompt(&self, name: Option<&String>) -> String {
+        let Some(name) = name else {
+            return String::new();
+        };
+        self.config
+            .read()
+            .await
+            .roles
+            .get(name)
+            .map(|role| role.prompt.clone())
+            .unwrap_or_default()
+    }
+
+    async fn group_for(&self, task: &TaskObject) -> Option<String> {
+        if let Some(group) = &task.group {
+            return Some(group.id.clone());
+        }
+
+        let budget = self.config.read().await.agent.group_iteration_budget;
+        if budget == 0 {
+            return None;
+        }
+
+        let id = format!("g-{}", &task.task_id[..task.task_id.len().min(8)]);
+        if let Err(e) = self.board.open_group(&id, &task.message, budget).await {
+            self.tell(format!("  x board · could not open a group: {}", e));
+            return None;
+        }
+
+        self.join_group(&task.agent_id, &id).await;
+        Some(id)
+    }
+
+    async fn join_group(&self, agent_id: &str, group_id: &str) {
+        self.memberships
+            .write()
+            .await
+            .insert(agent_id.to_string(), group_id.to_string());
+    }
+
+    async fn group_of(&self, agent_id: &str) -> Option<String> {
+        self.memberships.read().await.get(agent_id).cloned()
+    }
+
+    async fn leave_group(&self, agent_id: &str) {
+        self.memberships.write().await.remove(agent_id);
+    }
+
+    async fn group_view(&self, id: &str) -> Option<crate::core::task::GroupView> {
+        let group = self.board.group(id).await.ok().flatten()?;
+        let left = group.left();
+        Some(crate::core::task::GroupView {
+            id: group.id,
+            goal: group.goal,
+            iterations_left: left,
+            members: self
+                .agents
+                .snapshot()
+                .await
+                .into_iter()
+                .filter(|entry| entry.group_id.as_deref() == Some(id))
+                .map(|entry| match entry.role {
+                    Some(role) => format!("{} ({})", entry.agent_id, role),
+                    None => entry.agent_id,
+                })
+                .collect(),
+        })
     }
 
     async fn skill_descriptions(&self) -> Vec<TaskObjectSkill> {
@@ -1110,6 +1633,39 @@ impl Agent {
                         continue;
                     }
 
+                    if source == "board" {
+                        let Some(group) = &task.group else {
+                            results.push(
+                                "[ERROR] you are not working in a group, so there is no board"
+                                    .to_string(),
+                            );
+                            continue;
+                        };
+
+                        ui.show_status("board").await?;
+
+                        match self.board.entries(&group.id).await {
+                            Ok(entries) => results.push(format!(
+                                "[BOARD] group {} · {} · {} shared iterations left · with {}\n{}",
+                                group.id,
+                                first_line(&group.goal),
+                                group.iterations_left,
+                                if group.members.is_empty() {
+                                    "nobody yet".to_string()
+                                } else {
+                                    group.members.join(", ")
+                                },
+                                crate::core::board::as_text(
+                                    &entries,
+                                    &task.agent_id,
+                                    task.role.as_deref()
+                                )
+                            )),
+                            Err(e) => results.push(format!("[ERROR] the board: {}", e)),
+                        }
+                        continue;
+                    }
+
                     if source == "agents" {
                         ui.show_status("agents").await?;
 
@@ -1124,7 +1680,7 @@ impl Agent {
 
                     if source != "memory" {
                         results.push(format!(
-                            "[ERROR] unknown data source '{}', only 'memory', 'skill' and 'agents' are supported",
+                            "[ERROR] unknown data source '{}', only 'memory', 'skill', 'agents' and 'board' are supported",
                             source
                         ));
                         continue;
@@ -1210,6 +1766,7 @@ impl Agent {
                 ActionType::SpawnAgent {
                     task: subtask,
                     reason,
+                    role,
                 } => {
                     if subtask.trim().is_empty() {
                         results.push(
@@ -1243,7 +1800,35 @@ impl Agent {
                             .await?;
                     }
 
-                    let child = self.new_child_task(task, subtask).await;
+                    let wanted = role.trim();
+                    if !wanted.is_empty() && !self.role_exists(wanted).await {
+                        results.push(format!(
+                            "[SUBAGENT ERROR] there is no role called '{}'. Known roles: {}.                              Spawn without a role to get a plain copy of yourself.",
+                            wanted,
+                            self.role_names().await
+                        ));
+                        continue;
+                    }
+
+                    let group_id = self.group_for(task).await;
+
+                    if task.group.is_none()
+                        && let Some(id) = &group_id
+                    {
+                        self.leave_report(
+                            &task.agent_id,
+                            format!(
+                                "[GROUP] you opened group {} for this work. Everything you spawn \
+                                 from here shares it, along with one board and one pot of \
+                                 iterations. RequestData source 'board' reads it.",
+                                id
+                            ),
+                        )
+                        .await;
+                    }
+                    let child = self
+                        .new_child_task(task, subtask, wanted, group_id.clone())
+                        .await;
                     let child_id = child.agent_id.clone();
                     let shown_id = child_id.clone();
                     let parent_task = task.task_id.clone();
@@ -1273,11 +1858,54 @@ impl Agent {
                     }));
 
                     results.push(format!(
-                        "[SUBAGENT] {} is now working on '{}' on its own. Do not wait for it — \
+                        "[SUBAGENT] {}{} is now working on '{}' on its own. Do not wait for it — \
                          carry on, or answer the user. Its report reaches you on a later turn; \
-                         RequestData source 'agents' shows what it is doing meanwhile.",
-                        shown_id, errand
+                         RequestData source 'agents' shows what it is doing meanwhile.{}",
+                        shown_id,
+                        if wanted.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" as {}", wanted)
+                        },
+                        errand,
+                        match &group_id {
+                            Some(id) => format!(
+                                " You share group {} with it; RequestData source 'board' is where \
+                                 you both leave findings.",
+                                id
+                            ),
+                            None => String::new(),
+                        }
                     ));
+                }
+
+                ActionType::PostToBoard {
+                    kind,
+                    to,
+                    body,
+                    entry,
+                    state,
+                } => {
+                    results.push(self.use_board(task, kind, to, body, *entry, state).await);
+                }
+
+                ActionType::AskAgent { to, message } => {
+                    results.push(self.ask_agent(task, to, message).await);
+                }
+
+                ActionType::RequestGrant {
+                    skills,
+                    new_skills,
+                    risky,
+                    why,
+                    critical,
+                } => {
+                    let wanted = Grant {
+                        skills: skills.clone(),
+                        new_skills: *new_skills,
+                        risky: *risky,
+                    };
+                    results.push(self.expand_grant(ui, task, &wanted, why, *critical).await?);
                 }
 
                 ActionType::Switch { level, why } => {
@@ -2166,24 +2794,57 @@ fn own_messages(
         .collect()
 }
 
-fn queue_report(waiting: &mut Vec<(String, String)>, for_agent: &str, text: String) {
+fn queue_report(waiting: &mut Vec<Letter>, letter: Letter) {
     if waiting.len() >= REPORTS_KEPT {
         waiting.remove(0);
     }
-    waiting.push((for_agent.to_string(), text));
+    waiting.push(letter);
 }
 
-fn drain_reports(waiting: &mut Vec<(String, String)>, for_agent: &str) -> Vec<String> {
+fn drain_reports(waiting: &mut Vec<Letter>, for_agent: &str) -> Vec<Letter> {
     let mut mine = Vec::new();
-    waiting.retain(|(to, text)| {
-        if to == for_agent {
-            mine.push(text.clone());
+    waiting.retain(|letter| {
+        if letter.to == for_agent {
+            mine.push(letter.clone());
             false
         } else {
             true
         }
     });
     mine
+}
+
+fn apply_letters(task: &mut TaskObject, delivered: &[Letter]) {
+    for letter in delivered {
+        if let Some(tighter) = &letter.narrow {
+            task.grant = Some(match &task.grant {
+                Some(current) => current.narrow(tighter),
+                None => tighter.clone(),
+            });
+        }
+
+        if let Some(wider) = &letter.widen {
+            task.grant = Some(match &task.grant {
+                Some(current) => widen(current, wider),
+                None => wider.clone(),
+            });
+        }
+    }
+}
+
+fn widen(current: &Grant, extra: &Grant) -> Grant {
+    let mut skills = current.skills.clone();
+    for skill in &extra.skills {
+        if !skills.iter().any(|have| have == skill) {
+            skills.push(skill.clone());
+        }
+    }
+
+    Grant {
+        skills,
+        new_skills: current.new_skills || extra.new_skills,
+        risky: current.risky || extra.risky,
+    }
 }
 
 fn join_reports(existing: Option<String>, delivered: Vec<String>) -> String {
@@ -2213,6 +2874,15 @@ fn child_report(
             e
         ),
     }
+}
+
+fn discussion_key(group: &str, a: &str, b: &str) -> String {
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    format!("{}|{}|{}", group, first, second)
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn first_line(text: &str) -> String {
@@ -2316,13 +2986,18 @@ mod subagent_tests {
     #[test]
     fn a_report_reaches_the_agent_that_spawned_the_child_and_nobody_else() {
         let mut waiting = Vec::new();
-        queue_report(&mut waiting, "parent", "[SUBAGENT] mine".to_string());
-        queue_report(&mut waiting, "stranger", "[SUBAGENT] not yours".to_string());
-
-        assert_eq!(
-            drain_reports(&mut waiting, "parent"),
-            vec!["[SUBAGENT] mine"]
+        queue_report(
+            &mut waiting,
+            Letter::plain("parent", "[SUBAGENT] mine".to_string()),
         );
+        queue_report(
+            &mut waiting,
+            Letter::plain("stranger", "[SUBAGENT] not yours".to_string()),
+        );
+
+        let mine = drain_reports(&mut waiting, "parent");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].text, "[SUBAGENT] mine");
         assert_eq!(
             waiting.len(),
             1,
@@ -2333,7 +3008,10 @@ mod subagent_tests {
     #[test]
     fn a_report_is_delivered_once_and_not_again_on_every_later_turn() {
         let mut waiting = Vec::new();
-        queue_report(&mut waiting, "parent", "[SUBAGENT] done".to_string());
+        queue_report(
+            &mut waiting,
+            Letter::plain("parent", "[SUBAGENT] done".to_string()),
+        );
 
         assert_eq!(drain_reports(&mut waiting, "parent").len(), 1);
         assert!(
@@ -2346,12 +3024,12 @@ mod subagent_tests {
     fn an_agent_that_never_comes_back_cannot_grow_the_queue_without_end() {
         let mut waiting = Vec::new();
         for n in 0..REPORTS_KEPT + 5 {
-            queue_report(&mut waiting, "gone", format!("report {n}"));
+            queue_report(&mut waiting, Letter::plain("gone", format!("report {n}")));
         }
 
         assert_eq!(waiting.len(), REPORTS_KEPT);
         assert_eq!(
-            waiting.last().map(|(_, text)| text.as_str()),
+            waiting.last().map(|letter| letter.text.as_str()),
             Some(format!("report {}", REPORTS_KEPT + 4).as_str()),
             "the queue dropped the newest instead of the oldest"
         );
@@ -2393,6 +3071,120 @@ mod subagent_tests {
             joined.lines().count(),
             2,
             "a report was swallowed: {joined}"
+        );
+    }
+
+    fn grant(skills: &[&str], new_skills: bool, risky: bool) -> Grant {
+        Grant {
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+            new_skills,
+            risky,
+        }
+    }
+
+    fn task_with(grant: Option<Grant>) -> TaskObject {
+        TaskObject {
+            task_id: "t".to_string(),
+            agent_id: "a".to_string(),
+            parent_task_id: None,
+            message: String::new(),
+            system_info: system_info(),
+            system_response: None,
+            skills: Vec::new(),
+            capabilities: Vec::new(),
+            constraints: Constraints {
+                max_iterations: 10,
+                max_fix_iterations: 5,
+            },
+            iteration: 0,
+            fix_iteration: 0,
+            depth: 0,
+            role: None,
+            group: None,
+            grant,
+            origin: None,
+            intelligence: None,
+            interface_mode: InterfaceMode::Cli,
+        }
+    }
+
+    #[test]
+    fn a_sideways_request_narrows_the_agent_that_answers_it() {
+        let mut task = task_with(Some(grant(&["shell_executor", "telegram"], true, true)));
+
+        apply_letters(
+            &mut task,
+            &[Letter {
+                to: "a".to_string(),
+                text: "[FROM abc] have a look".to_string(),
+                narrow: Some(grant(&["telegram"], false, false)),
+                widen: None,
+            }],
+        );
+
+        let now = task.grant.expect("the grant went missing");
+        assert_eq!(now.skills, vec!["telegram"]);
+        assert!(!now.new_skills, "the asker's answer kept a right it lacked");
+        assert!(!now.risky);
+    }
+
+    #[test]
+    fn a_granted_right_arrives_on_the_next_turn_and_adds_to_what_was_there() {
+        let mut task = task_with(Some(grant(&["telegram"], false, false)));
+
+        apply_letters(
+            &mut task,
+            &[Letter {
+                to: "a".to_string(),
+                text: "[RIGHTS] widened".to_string(),
+                narrow: None,
+                widen: Some(grant(&["shell_executor"], false, false)),
+            }],
+        );
+
+        let now = task.grant.expect("the grant went missing");
+        assert!(now.allows("telegram"), "the old right was thrown away");
+        assert!(now.allows("shell_executor"), "the new right never landed");
+    }
+
+    #[test]
+    fn a_narrowing_that_lands_after_a_widening_still_wins() {
+        let mut task = task_with(Some(grant(&["telegram"], false, false)));
+
+        apply_letters(
+            &mut task,
+            &[
+                Letter {
+                    to: "a".to_string(),
+                    text: "wider".to_string(),
+                    narrow: None,
+                    widen: Some(grant(&["shell_executor"], true, true)),
+                },
+                Letter {
+                    to: "a".to_string(),
+                    text: "on behalf of someone smaller".to_string(),
+                    narrow: Some(grant(&["telegram"], false, false)),
+                    widen: None,
+                },
+            ],
+        );
+
+        let now = task.grant.expect("the grant went missing");
+        assert_eq!(now.skills, vec!["telegram"]);
+        assert!(!now.risky);
+    }
+
+    #[test]
+    fn two_agents_talking_are_counted_the_same_way_round_either_way() {
+        assert_eq!(
+            discussion_key("g", "alice", "bob"),
+            discussion_key("g", "bob", "alice"),
+            "a pair could double its turns by swapping who asks"
+        );
+        assert_ne!(
+            discussion_key("g1", "alice", "bob"),
+            discussion_key("g2", "alice", "bob"),
+            "two groups shared one discussion budget"
         );
     }
 
@@ -2534,6 +3326,8 @@ mod expansion_tests {
             iteration: 0,
             fix_iteration: 0,
             depth: 0,
+            role: None,
+            group: None,
             grant,
             origin: None,
             intelligence: None,

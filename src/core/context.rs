@@ -210,6 +210,8 @@ mod tests {
                 jumabek_home: "C:\\Users\\test\\.jumabek".to_string(),
             },
             system_response: None,
+            role: None,
+            group: None,
             skills: Vec::new(),
             capabilities: vec!["execute_module".to_string()],
             constraints: Constraints {

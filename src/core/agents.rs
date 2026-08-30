@@ -83,6 +83,12 @@ impl AgentEntry {
         self
     }
 
+    pub fn belonging(mut self, group_id: Option<String>, role: Option<String>) -> Self {
+        self.group_id = group_id;
+        self.role = role;
+        self
+    }
+
     pub fn allowed(mut self, iterations: u32) -> Self {
         self.max_iterations = iterations;
         self
@@ -100,8 +106,12 @@ impl AgentEntry {
 
     pub fn line(&self) -> String {
         format!(
-            "agent {} · {} · iteration {}/{} · {}s\n  task: {}\n  doing: {}",
+            "agent {}{} · {} · iteration {}/{} · {}s\n  task: {}\n  doing: {}",
             self.agent_id,
+            match &self.role {
+                Some(role) => format!(" the {}", role),
+                None => String::new(),
+            },
             self.state,
             self.iteration,
             self.max_iterations,

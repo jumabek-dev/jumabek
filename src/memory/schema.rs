@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -54,6 +54,38 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state, next_run);
+
+CREATE TABLE IF NOT EXISTS agent_groups (
+    id         TEXT PRIMARY KEY,
+    goal       TEXT NOT NULL,
+    budget     INTEGER NOT NULL,
+    spent      INTEGER NOT NULL DEFAULT 0,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS board (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id   TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    addressee  TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_group ON board(group_id, id);
+
+CREATE TABLE IF NOT EXISTS grant_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    asked_by   TEXT NOT NULL,
+    wanted     TEXT NOT NULL,
+    why        TEXT NOT NULL,
+    verdict    TEXT NOT NULL,
+    decided_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,

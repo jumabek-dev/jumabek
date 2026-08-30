@@ -75,6 +75,33 @@ impl Grant {
         self.skills.iter().any(|s| s == skill || s == "*")
     }
 
+    pub fn narrow(&self, other: &Grant) -> Grant {
+        let mine = self.skills.iter().any(|s| s == "*");
+        let theirs = other.skills.iter().any(|s| s == "*");
+
+        let skills = if mine {
+            other.skills.clone()
+        } else if theirs {
+            self.skills.clone()
+        } else {
+            self.skills
+                .iter()
+                .filter(|skill| other.allows(skill))
+                .cloned()
+                .collect()
+        };
+
+        Grant {
+            skills,
+            new_skills: self.new_skills && other.new_skills,
+            risky: self.risky && other.risky,
+        }
+    }
+
+    pub fn within(&self, ceiling: &Grant) -> bool {
+        self.narrow(ceiling) == *self
+    }
+
     pub fn describe(&self) -> String {
         let skills = if self.skills.is_empty() {
             "no skills".to_string()
@@ -96,6 +123,93 @@ impl Grant {
             format!("{}; {}", skills, extras.join("; "))
         }
     }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+
+    fn grant(skills: &[&str], new_skills: bool, risky: bool) -> Grant {
+        Grant {
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+            new_skills,
+            risky,
+        }
+    }
+
+    #[test]
+    fn asking_a_peer_cannot_reach_past_what_the_asker_already_had() {
+        let asker = grant(&["searxng_search"], false, false);
+        let peer = grant(&["shell_executor", "searxng_search"], true, true);
+
+        let effective = peer.narrow(&asker);
+
+        assert_eq!(effective.skills, vec!["searxng_search"]);
+        assert!(
+            !effective.skills.iter().any(|s| s == "shell_executor"),
+            "an agent laundered its way to the shell through a peer"
+        );
+        assert!(!effective.new_skills, "writing skills leaked sideways");
+        assert!(!effective.risky, "the risky flag leaked sideways");
+    }
+
+    #[test]
+    fn two_agents_that_share_nothing_end_up_able_to_do_nothing() {
+        let a = grant(&["telegram"], false, false);
+        let b = grant(&["shell_executor"], false, false);
+
+        assert!(a.narrow(&b).skills.is_empty());
+    }
+
+    #[test]
+    fn a_wildcard_gives_way_to_the_narrower_side() {
+        let open = grant(&["*"], true, true);
+        let tight = grant(&["telegram"], false, false);
+
+        assert_eq!(open.narrow(&tight).skills, vec!["telegram"]);
+        assert_eq!(tight.narrow(&open).skills, vec!["telegram"]);
+    }
+
+    #[test]
+    fn narrowing_never_hands_out_a_flag_neither_side_had() {
+        let a = grant(&["*"], true, false);
+        let b = grant(&["*"], false, true);
+
+        let effective = a.narrow(&b);
+        assert!(!effective.new_skills);
+        assert!(!effective.risky);
+    }
+
+    #[test]
+    fn a_request_above_the_ceiling_is_seen_as_above_it() {
+        let ceiling = grant(&["*"], false, false);
+
+        assert!(grant(&["shell_executor"], false, false).within(&ceiling));
+        assert!(
+            !grant(&["shell_executor"], true, false).within(&ceiling),
+            "writing new skills slipped past a ceiling that forbids it"
+        );
+        assert!(
+            !grant(&[], false, true).within(&ceiling),
+            "running risky commands slipped past a ceiling that forbids it"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_names_skills_refuses_one_it_does_not_name() {
+        let ceiling = grant(&["telegram", "searxng_search"], false, false);
+
+        assert!(grant(&["telegram"], false, false).within(&ceiling));
+        assert!(!grant(&["shell_executor"], false, false).within(&ceiling));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupView {
+    pub id: String,
+    pub goal: String,
+    pub iterations_left: u32,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +239,10 @@ pub struct TaskObject {
     pub origin: Option<Origin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intelligence: Option<crate::core::intelligence::Standing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupView>,
     pub interface_mode: InterfaceMode,
 }
 
@@ -261,6 +379,45 @@ pub enum ActionType {
         task: String,
         #[serde(default, deserialize_with = "flexible_string")]
         reason: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        role: String,
+    },
+    #[serde(alias = "Board", alias = "WriteToBoard")]
+    PostToBoard {
+        #[serde(default, deserialize_with = "flexible_string")]
+        kind: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        to: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        body: String,
+        #[serde(default)]
+        entry: i64,
+        #[serde(default, deserialize_with = "flexible_string")]
+        state: String,
+    },
+    #[serde(alias = "Ask", alias = "MessageAgent", alias = "TalkTo")]
+    AskAgent {
+        #[serde(default, deserialize_with = "flexible_string")]
+        to: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        message: String,
+    },
+    #[serde(
+        alias = "AskForGrant",
+        alias = "ExpandGrant",
+        alias = "RequestPermissionFor"
+    )]
+    RequestGrant {
+        #[serde(default, deserialize_with = "flexible_string_vec")]
+        skills: Vec<String>,
+        #[serde(default)]
+        new_skills: bool,
+        #[serde(default)]
+        risky: bool,
+        #[serde(default, deserialize_with = "flexible_string")]
+        why: String,
+        #[serde(default)]
+        critical: bool,
     },
     GenerateChunk {
         module_name: String,
@@ -297,7 +454,16 @@ impl ActionType {
             ActionType::ScheduleJob { name, .. } => format!("schedule · {}", name),
             ActionType::ManageJobs { operation, .. } => format!("jobs · {}", operation),
             ActionType::Switch { level, .. } => format!("intelligence · {}", level),
+            ActionType::SpawnAgent { role, .. } if !role.trim().is_empty() => {
+                format!("spawning a {}", role)
+            }
             ActionType::SpawnAgent { .. } => "spawning a sub-agent".to_string(),
+            ActionType::PostToBoard { kind, entry, .. } if *entry > 0 => {
+                format!("board · #{} {}", entry, kind)
+            }
+            ActionType::PostToBoard { kind, .. } => format!("board · {}", kind),
+            ActionType::AskAgent { to, .. } => format!("asking {}", to),
+            ActionType::RequestGrant { why, .. } => format!("asking for rights · {}", why),
             ActionType::GenerateChunk {
                 module_name,
                 chunk_index,

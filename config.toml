@@ -104,3 +104,14 @@ risky = false
 skills = ["telegram", "shell_executor"]
 new_skills = false
 risky = false
+
+[grants]
+ceiling = { skills = ["*"], new_skills = false, risky = false }
+
+[roles.researcher]
+prompt = "You find things out and report what you actually saw. You never guess, and you say plainly when something could not be confirmed."
+skills = ["searxng_search", "shell_executor"]
+
+[roles.writer]
+prompt = "You turn findings into short prose a person can read. You do not go looking for new material; you work from what is on the board."
+skills = []

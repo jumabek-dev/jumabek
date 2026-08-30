@@ -358,6 +358,28 @@ async fn manage(command: &Manage) -> JumabekResult<()> {
             watch_agents(config.inbox.port, *once).await?;
         }
 
+        Manage::Rights => {
+            let (config, _) = Config::load()?;
+            let written = core::board::Board::open(&config.db_path())?
+                .expansions()
+                .await?;
+
+            println!();
+            if written.is_empty() {
+                println!("  nobody has been granted anything beyond what config.toml says");
+            } else {
+                for line in written {
+                    println!("  {}", line);
+                }
+            }
+            println!();
+            println!(
+                "  ceiling: {} — nothing at runtime can go past it",
+                config.grants.ceiling.describe()
+            );
+            println!();
+        }
+
         Manage::Inbox => {
             let (config, _) = Config::load()?;
             println!();

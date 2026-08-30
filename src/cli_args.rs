@@ -47,6 +47,7 @@ pub enum Manage {
         #[arg(long)]
         once: bool,
     },
+    Rights,
     Inbox,
     Profile,
     ForgetSubject {
