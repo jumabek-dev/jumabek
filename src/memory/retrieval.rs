@@ -8,8 +8,10 @@ pub fn to_blob(vector: &[f32]) -> Vec<u8> {
 }
 
 pub fn from_blob(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|four| f32::from_le_bytes([four[0], four[1], four[2], four[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|four| f32::from_le_bytes(*four))
         .collect()
 }
 
