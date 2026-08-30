@@ -61,6 +61,19 @@ pub fn append_note(note: &str) -> JumabekResult<()> {
     Ok(())
 }
 
+pub fn fetched_block(facts: &[Fact]) -> String {
+    let rendered = crate::memory::facts::render(facts);
+    if rendered.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "ALSO WORTH KNOWING, GIVEN WHAT IS BEING DISCUSSED\n\n         These were picked out because they look relevant to this turn, so the list changes \
+         as the subject does. Use them the same way as the rest.\n\n{}\n",
+        rendered
+    )
+}
+
 pub fn block(facts: &[Fact], notes: &str) -> String {
     let rendered = crate::memory::facts::render(facts);
 

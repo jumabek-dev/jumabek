@@ -383,6 +383,44 @@ async fn manage(command: &Manage) -> JumabekResult<()> {
             watch_agents(config.inbox.port, *once).await?;
         }
 
+        Manage::Tokens => {
+            let (config, _) = Config::load()?;
+            let memory = Memory::open(&config.db_path(), "cli").await?;
+            let spending = memory.spending().await?;
+
+            println!();
+            if spending.is_empty() {
+                println!("  no turns have been counted yet");
+                println!();
+                println!("  Counts appear here once a provider reports them. Everything the");
+                println!("  session prints while running is a local estimate, not a bill.");
+                println!();
+                return Ok(());
+            }
+
+            for row in &spending {
+                println!("  {} · {}", row.model, row.protocol);
+                println!(
+                    "       {} turn(s) · {} in · {} out — counted by the provider",
+                    row.turns, row.counted_in, row.counted_out
+                );
+                println!(
+                    "       {} in — guessed locally before sending",
+                    row.guessed_in
+                );
+
+                if row.turns_that_reported_caching == 0 {
+                    println!("       caching: this endpoint reports nothing either way");
+                } else {
+                    println!(
+                        "       caching: {} read, {} written, over {} of {} turn(s)",
+                        row.cache_read, row.cache_write, row.turns_that_reported_caching, row.turns
+                    );
+                }
+                println!();
+            }
+        }
+
         Manage::Rights => {
             let (config, _) = Config::load()?;
             let written = core::board::Board::open(&config.db_path())?

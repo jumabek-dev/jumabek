@@ -323,7 +323,12 @@ same on every chunk of a module — change it halfway and the buffer is dropped.
 ```
 {"type":"Switch","level":"high","why":"this needs real code, not a shell one-liner"}
 ```
-`low`, `medium` or `high`. Moving up needs a `why`; moving down does not.
+`low`, `medium` or `high`. Moving up needs a `why`.
+
+**You cannot go back down inside a task, and asking is refused.** Each model keeps its own
+cache of the standing part of your context. Coming down and up again throws that away twice
+and the whole context is re-read at full price — which is most of what a long task costs. Go
+up once when you need to, then stay there. The next task starts at the default on its own.
 
 **16. RespondToUser** — you are answering directly, no skill involved.
 ```

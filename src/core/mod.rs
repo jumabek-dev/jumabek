@@ -18,5 +18,6 @@ pub mod safety;
 pub mod scheduler;
 pub mod self_improvement;
 pub mod task;
+pub mod usage;
 pub mod validator;
 pub mod workshop;

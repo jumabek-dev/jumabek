@@ -103,6 +103,10 @@ impl Reason {
     pub fn refunds_the_iteration(self) -> bool {
         matches!(self, Reason::UnreadableAnswer | Reason::Circling)
     }
+
+    pub fn may_go_down(self) -> bool {
+        matches!(self, Reason::TaskFinished | Reason::NobodyWatching)
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +142,28 @@ mod tests {
         for raw in ["genius", "opus", "3", ""] {
             assert_eq!(Level::parse(raw), None, "{raw} was quietly accepted");
         }
+    }
+
+    #[test]
+    fn nothing_may_drop_to_a_cheaper_model_in_the_middle_of_a_task() {
+        for reason in [
+            Reason::UnreadableAnswer,
+            Reason::BuildAttempts,
+            Reason::WritingASkill,
+            Reason::Circling,
+            Reason::ModelAsked,
+        ] {
+            assert!(
+                !reason.may_go_down(),
+                "{reason:?} could descend mid-task, which throws away the prompt cache"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_task_and_an_unattended_one_may_start_lower() {
+        assert!(Reason::TaskFinished.may_go_down());
+        assert!(Reason::NobodyWatching.may_go_down());
     }
 
     #[test]

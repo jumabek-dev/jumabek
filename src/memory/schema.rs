@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS board (
 );
 
 CREATE INDEX IF NOT EXISTS idx_board_group ON board(group_id, id);
+
+CREATE TABLE IF NOT EXISTS token_usage (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL,
+    task_id     TEXT,
+    model       TEXT NOT NULL,
+    protocol    TEXT NOT NULL,
+    counted_in  INTEGER NOT NULL,
+    counted_out INTEGER NOT NULL,
+    cache_read  INTEGER,
+    cache_write INTEGER,
+    guessed_in  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_session ON token_usage(session_id, id);
 
 CREATE TABLE IF NOT EXISTS grant_audit (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

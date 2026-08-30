@@ -48,6 +48,7 @@ pub enum Manage {
         once: bool,
     },
     Rights,
+    Tokens,
     Inbox,
     Profile,
     ForgetSubject {

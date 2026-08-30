@@ -444,6 +444,10 @@ impl Agent {
             return false;
         }
 
+        if level < standing.level && !reason.may_go_down() {
+            return false;
+        }
+
         let from = standing.level;
         standing.changed_from = Some(from);
         standing.why = Some(reason.explain().to_string());
@@ -693,6 +697,41 @@ impl Agent {
             self.log_turn(&task, &reply.response, &reply.raw_content)
                 .await?;
 
+            if let Some(counted) = reply.usage {
+                let target = target_for(&*self.config.read().await, level);
+                if let Err(e) = self
+                    .memory
+                    .log_usage(
+                        &task.task_id,
+                        &target.model,
+                        target.protocol.id(),
+                        &counted,
+                        built.total_tokens as u32,
+                    )
+                    .await
+                {
+                    self.tell(format!("  x tokens · not recorded: {}", e));
+                }
+
+                let far_off = counted.billed_input().abs_diff(built.total_tokens as u32)
+                    > built.total_tokens as u32 / 4;
+                let cached = counted.cache_read.unwrap_or(0) > 0;
+
+                if far_off || cached {
+                    ui.show_status(&format!(
+                        "tokens counted {} · guessed {}{}",
+                        counted.describe(),
+                        built.total_tokens,
+                        if counted.says_anything_about_caching() {
+                            ""
+                        } else {
+                            " (this endpoint reports no cache figures)"
+                        }
+                    ))
+                    .await?;
+                }
+            }
+
             if !reply.response.message.trim().is_empty() && !is_stall(&reply.response) {
                 last_message = reply.response.message.clone();
                 if task.depth == 0 {
@@ -781,30 +820,35 @@ impl Agent {
         Ok(own_messages(history, &task.task_id))
     }
 
-    async fn profile_block(&self, task: &TaskObject) -> String {
+    async fn profile_block(&self, task: &TaskObject) -> crate::core::context::Profile {
         let project = self.project.read().await.clone();
         let facts = self
             .memory
             .facts_for(&task.message, project.as_deref())
             .await
             .unwrap_or_default();
-        let block = profile::block(&facts, &profile::read_notes());
+
+        let (pinned, fetched): (Vec<_>, Vec<_>) = facts.into_iter().partition(|fact| fact.pinned);
+
+        let mut stable = profile::block(&pinned, &profile::read_notes());
 
         let fragment = self.role_prompt(task.role.as_ref()).await;
-        if fragment.trim().is_empty() {
-            return block;
+        if !fragment.trim().is_empty() {
+            let named = format!(
+                "You are working as the {}.\n{}",
+                task.role.as_deref().unwrap_or("agent"),
+                fragment.trim()
+            );
+            stable = if stable.is_empty() {
+                named
+            } else {
+                format!("{}\n\n{}", stable, named)
+            };
         }
 
-        let named = format!(
-            "You are working as the {}.\n{}",
-            task.role.as_deref().unwrap_or("agent"),
-            fragment.trim()
-        );
-
-        if block.is_empty() {
-            named
-        } else {
-            format!("{}\n\n{}", block, named)
+        crate::core::context::Profile {
+            stable,
+            volatile: profile::fetched_block(&fetched),
         }
     }
 
@@ -859,10 +903,10 @@ impl Agent {
         loop {
             let mut sent = messages.to_vec();
             if attempt > 0 {
-                sent.push(crate::core::task::LlmMessage {
-                    role: "system".to_string(),
-                    content: PARSE_CORRECTION.to_string(),
-                });
+                sent.push(crate::core::task::LlmMessage::new(
+                    "system",
+                    PARSE_CORRECTION,
+                ));
             }
 
             let target = target_for(&*self.config.read().await, self.level().await);
@@ -2018,6 +2062,17 @@ impl Agent {
                              this task the current level cannot do."
                                 .to_string(),
                         );
+                        continue;
+                    }
+
+                    if wanted < current {
+                        results.push(format!(
+                            "[SWITCH REFUSED] you are on {} and cannot drop to {} in the middle \
+                             of a task. The prompt cache belongs to one model, so coming back \
+                             down and up again means paying to re-read this whole context twice. \
+                             The next task starts at the default level on its own.",
+                            current, wanted
+                        ));
                         continue;
                     }
 

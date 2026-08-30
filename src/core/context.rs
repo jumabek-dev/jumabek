@@ -11,6 +11,12 @@ pub struct ContextBuilder {
     budget: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Profile {
+    pub stable: String,
+    pub volatile: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct BuiltContext {
     pub messages: Vec<LlmMessage>,
@@ -39,23 +45,23 @@ impl ContextBuilder {
         history: &[StoredMessage],
         current: &TaskObject,
     ) -> JumabekResult<BuiltContext> {
-        self.build_with_profile(history, current, "")
+        self.build_with_profile(history, current, &Profile::default())
     }
 
     pub fn build_with_profile(
         &self,
         history: &[StoredMessage],
         current: &TaskObject,
-        profile: &str,
+        profile: &Profile,
     ) -> JumabekResult<BuiltContext> {
         let current_json = serde_json::to_string(current)
             .map_err(|e| JumabekError::ParseError(format!("cannot encode task object: {}", e)))?;
 
-        let profile_tokens = if profile.is_empty() {
-            0
-        } else {
-            token_counter::count_message("system", profile)
-        };
+        let profile_tokens = [profile.stable.as_str(), profile.volatile.as_str()]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .map(|part| token_counter::count_message("system", part))
+            .sum::<usize>();
 
         let system_tokens =
             token_counter::count_message("system", &self.system_prompt) + profile_tokens;
@@ -72,35 +78,30 @@ impl ContextBuilder {
         let groups = group_by_task(history);
         let (kept, trimmed_messages) = fit_groups(groups, self.budget - anchors);
 
-        let mut messages = Vec::with_capacity(kept.len() + 3);
-        messages.push(LlmMessage {
-            role: "system".to_string(),
-            content: self.system_prompt.clone(),
-        });
+        let mut messages = Vec::with_capacity(kept.len() + 4);
+        messages.push(LlmMessage::new("system", self.system_prompt.clone()).unchanging());
 
-        if !profile.is_empty() {
-            messages.push(LlmMessage {
-                role: "system".to_string(),
-                content: profile.to_string(),
-            });
+        if !profile.stable.is_empty() {
+            messages.push(LlmMessage::new("system", profile.stable.clone()).unchanging());
+        }
+
+        if !profile.volatile.is_empty() {
+            messages.push(LlmMessage::new("system", profile.volatile.clone()));
         }
 
         if trimmed_messages > 0 {
-            messages.push(LlmMessage {
-                role: "user".to_string(),
-                content: format!(
+            messages.push(LlmMessage::new(
+                "user",
+                format!(
                     "[{} earlier messages were trimmed from this context. \
                      They are still stored — use RequestData with source \"memory\" to recall them.]",
                     trimmed_messages
                 ),
-            });
+            ));
         }
 
         messages.extend(kept);
-        messages.push(LlmMessage {
-            role: "user".to_string(),
-            content: current_json,
-        });
+        messages.push(LlmMessage::new("user", current_json));
 
         let total_tokens = messages
             .iter()
@@ -137,10 +138,7 @@ fn group_by_task(history: &[StoredMessage]) -> Vec<Vec<LlmMessage>> {
             .clone()
             .unwrap_or_else(|| format!("__msg_{}", stored.id));
 
-        let message = LlmMessage {
-            role: role.to_string(),
-            content: stored.llm_content().to_string(),
-        };
+        let message = LlmMessage::new(role, stored.llm_content());
 
         if current_key.as_deref() == Some(key.as_str())
             && let Some(last) = groups.last_mut()
@@ -228,10 +226,17 @@ mod tests {
         }
     }
 
+    fn stable(text: &str) -> Profile {
+        Profile {
+            stable: text.to_string(),
+            volatile: String::new(),
+        }
+    }
+
     #[test]
     fn the_profile_rides_along_with_the_system_prompt() {
         let built = ContextBuilder::new("you are jumabek", 10_000)
-            .build_with_profile(&[], &task_object(), "олжас — alias: балык")
+            .build_with_profile(&[], &task_object(), &stable("олжас — alias: балык"))
             .unwrap();
 
         assert_eq!(built.messages[0].role, "system");
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn an_empty_profile_adds_no_message() {
         let built = ContextBuilder::new("you are jumabek", 10_000)
-            .build_with_profile(&[], &task_object(), "")
+            .build_with_profile(&[], &task_object(), &stable(""))
             .unwrap();
 
         assert_eq!(
@@ -254,8 +259,11 @@ mod tests {
     #[test]
     fn a_profile_too_big_for_the_budget_is_refused_rather_than_silently_dropped() {
         let huge = "fact ".repeat(20_000);
-        let result =
-            ContextBuilder::new("short", 1_000).build_with_profile(&[], &task_object(), &huge);
+        let result = ContextBuilder::new("short", 1_000).build_with_profile(
+            &[],
+            &task_object(),
+            &stable(&huge),
+        );
 
         assert!(
             result.is_err(),
@@ -269,14 +277,14 @@ mod tests {
         let narrow = ContextBuilder::new("short", 1_000);
         assert!(
             narrow
-                .build_with_profile(&[], &task_object(), &huge)
+                .build_with_profile(&[], &task_object(), &stable(&huge))
                 .is_err()
         );
 
         let widened = narrow.rescaled(200_000);
         assert!(
             widened
-                .build_with_profile(&[], &task_object(), &huge)
+                .build_with_profile(&[], &task_object(), &stable(&huge))
                 .is_ok()
         );
         assert_eq!(widened.system_prompt, narrow.system_prompt);

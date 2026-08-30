@@ -507,6 +507,23 @@ pub struct AgentResponse {
 pub struct LlmMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip)]
+    pub stable: bool,
+}
+
+impl LlmMessage {
+    pub fn new(role: &str, content: impl Into<String>) -> LlmMessage {
+        LlmMessage {
+            role: role.to_string(),
+            content: content.into(),
+            stable: false,
+        }
+    }
+
+    pub fn unchanging(mut self) -> LlmMessage {
+        self.stable = true;
+        self
+    }
 }
 
 pub fn agent_response_schema() -> serde_json::Value {

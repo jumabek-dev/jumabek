@@ -27,6 +27,13 @@ impl Protocol {
             _ => None,
         }
     }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "openai",
+            Protocol::Anthropic => "anthropic",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -34,6 +41,7 @@ pub struct LlmClient {
     http: reqwest::Client,
     max_retries: u32,
     initial_delay_ms: u64,
+    cache_markers: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +73,12 @@ impl RequestTarget {
 pub struct LlmReply {
     pub response: AgentResponse,
     pub raw_content: String,
+    pub usage: Option<crate::core::usage::Usage>,
+}
+
+pub struct Answer {
+    pub content: String,
+    pub usage: Option<crate::core::usage::Usage>,
 }
 
 impl LlmClient {
@@ -79,6 +93,7 @@ impl LlmClient {
             http,
             max_retries: config.llm.retry_max_retries.max(1),
             initial_delay_ms: config.llm.retry_initial_delay_ms,
+            cache_markers: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -87,11 +102,12 @@ impl LlmClient {
         messages: &[LlmMessage],
         target: &RequestTarget,
     ) -> JumabekResult<LlmReply> {
-        let content = self.request_content(messages, target).await?;
-        let response = parse_agent_response(&content)?;
+        let answer = self.request(messages, target).await?;
+        let response = parse_agent_response(&answer.content)?;
         Ok(LlmReply {
             response,
-            raw_content: json_repair::extract_json_payload(&content),
+            raw_content: json_repair::extract_json_payload(&answer.content),
+            usage: answer.usage,
         })
     }
 
@@ -102,33 +118,35 @@ impl LlmClient {
         target: &RequestTarget,
     ) -> JumabekResult<String> {
         let messages = vec![
-            LlmMessage {
-                role: "system".to_string(),
-                content: system.to_string(),
-            },
-            LlmMessage {
-                role: "user".to_string(),
-                content: user.to_string(),
-            },
+            LlmMessage::new("system", system),
+            LlmMessage::new("user", user),
         ];
-        self.request_content(&messages, target).await
+        Ok(self.request(&messages, target).await?.content)
     }
 
-    async fn request_content(
+    async fn request(
         &self,
         messages: &[LlmMessage],
         target: &RequestTarget,
-    ) -> JumabekResult<String> {
-        let body = match target.protocol {
-            Protocol::OpenAi => build_openai_body(messages, target),
-            Protocol::Anthropic => build_anthropic_body(messages, target),
-        };
+    ) -> JumabekResult<Answer> {
+        let mut marking = self
+            .cache_markers
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut body = self.body_for(messages, target, marking);
 
         let mut last_error = JumabekError::LlmUnavailable("no attempt was made".to_string());
 
         for attempt in 0..self.max_retries {
             match self.attempt(&body, target).await {
-                Ok(content) => return Ok(content),
+                Ok(answer) => return Ok(answer),
+                Err(AttemptError::Fatal(e)) if marking && refused_the_marker(&e) => {
+                    self.cache_markers
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    marking = false;
+                    body = self.body_for(messages, target, false);
+                    last_error = e;
+                    continue;
+                }
                 Err(AttemptError::Fatal(e)) => return Err(e),
                 Err(AttemptError::Retryable(e)) => last_error = e,
             }
@@ -142,11 +160,23 @@ impl LlmClient {
         Err(last_error)
     }
 
+    fn body_for(
+        &self,
+        messages: &[LlmMessage],
+        target: &RequestTarget,
+        mark_cache: bool,
+    ) -> serde_json::Value {
+        match target.protocol {
+            Protocol::OpenAi => build_openai_body(messages, target, mark_cache),
+            Protocol::Anthropic => build_anthropic_body(messages, target, mark_cache),
+        }
+    }
+
     async fn attempt(
         &self,
         body: &serde_json::Value,
         target: &RequestTarget,
-    ) -> Result<String, AttemptError> {
+    ) -> Result<Answer, AttemptError> {
         let mut request = self
             .http
             .post(&target.endpoint)
@@ -196,14 +226,50 @@ impl LlmClient {
             return Err(classify_status(status, &text));
         }
 
-        extract_content(&text, target.protocol).map_err(AttemptError::Fatal)
+        let usage = crate::core::usage::parse(&text);
+        let content = extract_content(&text, target.protocol).map_err(AttemptError::Fatal)?;
+
+        Ok(Answer { content, usage })
     }
 }
 
-fn build_openai_body(messages: &[LlmMessage], target: &RequestTarget) -> serde_json::Value {
+fn last_stable(messages: &[LlmMessage]) -> Option<usize> {
+    messages.iter().rposition(|m| m.stable)
+}
+
+fn build_openai_body(
+    messages: &[LlmMessage],
+    target: &RequestTarget,
+    mark_cache: bool,
+) -> serde_json::Value {
+    let breakpoint = if mark_cache {
+        last_stable(messages)
+    } else {
+        None
+    };
+
+    let wire: Vec<serde_json::Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(at, m)| {
+            if Some(at) == breakpoint {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": [{
+                        "type": "text",
+                        "text": m.content,
+                        "cache_control": { "type": "ephemeral" }
+                    }]
+                })
+            } else {
+                serde_json::json!({ "role": m.role, "content": m.content })
+            }
+        })
+        .collect();
+
     let mut body = serde_json::json!({
         "model": target.model,
-        "messages": messages,
+        "messages": wire,
         "stream": false,
     });
 
@@ -225,13 +291,22 @@ fn build_openai_body(messages: &[LlmMessage], target: &RequestTarget) -> serde_j
     body
 }
 
-fn build_anthropic_body(messages: &[LlmMessage], target: &RequestTarget) -> serde_json::Value {
-    let system: Vec<&str> = messages
+fn build_anthropic_body(
+    messages: &[LlmMessage],
+    target: &RequestTarget,
+    mark_cache: bool,
+) -> serde_json::Value {
+    let system: Vec<&LlmMessage> = messages.iter().filter(|m| m.role == "system").collect();
+    let cut = if mark_cache {
+        system.iter().rposition(|m| m.stable)
+    } else {
+        None
+    };
+    let rest: Vec<serde_json::Value> = messages
         .iter()
-        .filter(|m| m.role == "system")
-        .map(|m| m.content.as_str())
+        .filter(|m| m.role != "system")
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
         .collect();
-    let rest: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
 
     let mut body = serde_json::json!({
         "model": target.model,
@@ -241,7 +316,19 @@ fn build_anthropic_body(messages: &[LlmMessage], target: &RequestTarget) -> serd
     });
 
     if !system.is_empty() {
-        body["system"] = serde_json::Value::String(system.join("\n\n"));
+        body["system"] = serde_json::Value::Array(
+            system
+                .iter()
+                .enumerate()
+                .map(|(at, m)| {
+                    let mut block = serde_json::json!({ "type": "text", "text": m.content });
+                    if Some(at) == cut {
+                        block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+                    }
+                    block
+                })
+                .collect(),
+        );
     }
 
     match target.reasoning_effort.as_str() {
@@ -264,6 +351,13 @@ fn build_anthropic_body(messages: &[LlmMessage], target: &RequestTarget) -> serd
     }
 
     body
+}
+
+fn refused_the_marker(error: &JumabekError) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("cache_control")
+        || text.contains("content")
+            && (text.contains("400") || text.contains("invalid") || text.contains("unsupported"))
 }
 
 enum AttemptError {
@@ -677,29 +771,143 @@ mod tests {
     #[test]
     fn anthropic_body_moves_system_out_of_messages_and_always_sets_max_tokens() {
         let messages = vec![
-            LlmMessage {
-                role: "system".to_string(),
-                content: "you are jumabek".to_string(),
-            },
-            LlmMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            },
+            LlmMessage::new("system", "you are jumabek"),
+            LlmMessage::new("user", "hi"),
         ];
 
-        let body = build_anthropic_body(&messages, &target(Protocol::Anthropic));
+        let body = build_anthropic_body(&messages, &target(Protocol::Anthropic), false);
 
-        assert_eq!(body["system"], "you are jumabek");
+        assert_eq!(body["system"][0]["text"], "you are jumabek");
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    fn turn(volatile: &str) -> Vec<LlmMessage> {
+        vec![
+            LlmMessage::new("system", "the standing instructions").unchanging(),
+            LlmMessage::new("system", "pinned: the user is called Aibar").unchanging(),
+            LlmMessage::new("system", format!("fetched for this turn: {}", volatile)),
+            LlmMessage::new("user", format!("please do {}", volatile)),
+        ]
+    }
+
+    #[test]
+    fn the_cache_is_cut_after_the_last_stable_block_on_the_anthropic_path() {
+        let body = build_anthropic_body(&turn("a"), &target(Protocol::Anthropic), true);
+        let system = body["system"].as_array().expect("system should be blocks");
+
+        assert_eq!(system.len(), 3);
+        assert!(system[0].get("cache_control").is_none());
+        assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            system[2].get("cache_control").is_none(),
+            "the marker sat after the part that changes every turn, so it can never hit"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_cut_after_the_last_stable_message_on_the_openai_path() {
+        let body = build_openai_body(&turn("a"), &target(Protocol::OpenAi), true);
+        let sent = body["messages"].as_array().unwrap();
+
+        assert!(sent[0]["content"].is_string());
+        assert_eq!(sent[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            sent[2]["content"].is_string(),
+            "a message that changes every turn was wrapped as if it were cacheable"
+        );
+    }
+
+    #[test]
+    fn the_cached_prefix_is_byte_identical_between_turns_that_share_it() {
+        let first = build_anthropic_body(&turn("one thing"), &target(Protocol::Anthropic), true);
+        let second = build_anthropic_body(&turn("another"), &target(Protocol::Anthropic), true);
+
+        let prefix = |body: &serde_json::Value| {
+            let blocks = body["system"].as_array().unwrap();
+            let cut = blocks
+                .iter()
+                .position(|b| b.get("cache_control").is_some())
+                .expect("nothing was marked");
+            serde_json::to_string(&blocks[..=cut]).unwrap()
+        };
+
+        assert_eq!(
+            prefix(&first),
+            prefix(&second),
+            "the cached prefix changed between turns, so every turn is a cache miss"
+        );
+        assert_ne!(first["system"], second["system"], "the test proved nothing");
+    }
+
+    #[test]
+    fn the_openai_cached_prefix_is_byte_identical_between_turns_too() {
+        let prefix = |volatile: &str| {
+            let body = build_openai_body(&turn(volatile), &target(Protocol::OpenAi), true);
+            let sent = body["messages"].as_array().unwrap().clone();
+            let cut = sent
+                .iter()
+                .position(|m| {
+                    m["content"]
+                        .get(0)
+                        .and_then(|c| c.get("cache_control"))
+                        .is_some()
+                })
+                .expect("nothing was marked");
+            serde_json::to_string(&sent[..=cut]).unwrap()
+        };
+
+        assert_eq!(prefix("one thing"), prefix("another"));
+    }
+
+    #[test]
+    fn nothing_is_marked_when_the_endpoint_has_already_refused_the_marker() {
+        let body = build_anthropic_body(&turn("a"), &target(Protocol::Anthropic), false);
+        assert!(
+            body["system"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b.get("cache_control").is_none())
+        );
+
+        let plain = build_openai_body(&turn("a"), &target(Protocol::OpenAi), false);
+        assert!(
+            plain["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["content"].is_string())
+        );
+    }
+
+    #[test]
+    fn a_turn_with_nothing_stable_in_it_is_sent_unmarked() {
+        let messages = vec![LlmMessage::new("user", "hi")];
+        let body = build_openai_body(&messages, &target(Protocol::OpenAi), true);
+
+        assert!(body["messages"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn an_endpoint_complaining_about_cache_control_makes_us_stop_sending_it() {
+        assert!(refused_the_marker(&JumabekError::LlmUnavailable(
+            "400 — unknown field cache_control".to_string()
+        )));
+        assert!(!refused_the_marker(&JumabekError::LlmUnavailable(
+            "401 — bad api key".to_string()
+        )));
+        assert!(!refused_the_marker(&JumabekError::LlmTimeout(
+            "took too long".to_string()
+        )));
     }
 
     #[test]
     fn anthropic_structured_output_forces_the_agent_response_tool() {
         let mut t = target(Protocol::Anthropic);
         t.structured_output = true;
-        let body = build_anthropic_body(&[], &t);
+        let body = build_anthropic_body(&[], &t, false);
 
         assert_eq!(body["tool_choice"]["name"], "agent_response");
         assert_eq!(body["tools"][0]["name"], "agent_response");

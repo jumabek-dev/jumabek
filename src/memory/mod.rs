@@ -105,6 +105,19 @@ pub struct MemoryHit {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Spending {
+    pub model: String,
+    pub protocol: String,
+    pub turns: u32,
+    pub counted_in: u32,
+    pub counted_out: u32,
+    pub cache_read: u32,
+    pub cache_write: u32,
+    pub turns_that_reported_caching: u32,
+    pub guessed_in: u32,
+}
+
 pub struct Memory {
     conn: Mutex<Connection>,
     session_id: i64,
@@ -309,6 +322,65 @@ impl Memory {
             .collect::<Result<Vec<_>, _>>()?;
 
         rows.reverse();
+        Ok(rows)
+    }
+
+    pub async fn log_usage(
+        &self,
+        task_id: &str,
+        model: &str,
+        protocol: &str,
+        usage: &crate::core::usage::Usage,
+        guessed_in: u32,
+    ) -> JumabekResult<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO token_usage (session_id, task_id, model, protocol, counted_in,
+                                      counted_out, cache_read, cache_write, guessed_in, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                self.session_id,
+                task_id,
+                model,
+                protocol,
+                usage.billed_input(),
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                guessed_in,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn spending(&self) -> JumabekResult<Vec<Spending>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT model, protocol, count(*), sum(counted_in), sum(counted_out),
+                    sum(coalesce(cache_read, 0)), sum(coalesce(cache_write, 0)),
+                    sum(cache_read IS NOT NULL), sum(guessed_in)
+               FROM token_usage
+              GROUP BY model, protocol
+              ORDER BY sum(counted_in) DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Spending {
+                    model: row.get(0)?,
+                    protocol: row.get(1)?,
+                    turns: row.get::<_, i64>(2)? as u32,
+                    counted_in: row.get::<_, i64>(3)? as u32,
+                    counted_out: row.get::<_, i64>(4)? as u32,
+                    cache_read: row.get::<_, i64>(5)? as u32,
+                    cache_write: row.get::<_, i64>(6)? as u32,
+                    turns_that_reported_caching: row.get::<_, i64>(7)? as u32,
+                    guessed_in: row.get::<_, i64>(8)? as u32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(rows)
     }
 
