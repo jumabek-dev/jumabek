@@ -82,6 +82,8 @@ fn default_ceiling() -> crate::core::task::Grant {
 pub struct MemorySection {
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub retrieval: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

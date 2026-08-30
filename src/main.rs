@@ -86,7 +86,31 @@ async fn main() -> JumabekResult<()> {
     let watchdog = Supervisor::open()?;
     watchdog.log_event(&format!("startup in {} mode", mode.as_str()));
 
-    let memory = Memory::open(&config.db_path(), mode.as_interface_mode().as_str()).await?;
+    let mut memory = Memory::open(&config.db_path(), mode.as_interface_mode().as_str()).await?;
+
+    if config.memory.retrieval {
+        if one_shot.is_none() {
+            ui.show_status("memory · starting the local embedding model")
+                .await?;
+        }
+
+        match memory.start_retrieval().await {
+            Ok(0) => {
+                if one_shot.is_none() {
+                    ui.show_status("memory · retrieval on, every fact already has a vector")
+                        .await?;
+                }
+            }
+            Ok(done) => {
+                ui.show_status(&format!("memory · retrieval on, {} fact(s) embedded", done))
+                    .await?;
+            }
+            Err(e) => {
+                ui.show_error(&format!("{} Carrying on with every fact loaded.", e))
+                    .await?;
+            }
+        }
+    }
     let mut registry = SkillRegistry::new();
     let skill_timeout = std::time::Duration::from_secs(config.agent.skill_timeout_sec);
     let loaded = loader::load_default(&mut registry, skill_timeout, &|name| {

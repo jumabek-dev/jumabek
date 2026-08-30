@@ -1,5 +1,6 @@
 pub mod facts;
 pub mod query;
+pub mod retrieval;
 pub mod schema;
 
 use std::path::Path;
@@ -8,7 +9,9 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 use tokio::sync::Mutex;
 
-use crate::error::JumabekResult;
+use crate::error::{JumabekError, JumabekResult};
+
+const EMBED_BATCH: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -105,6 +108,7 @@ pub struct MemoryHit {
 pub struct Memory {
     conn: Mutex<Connection>,
     session_id: i64,
+    embedder: Option<std::sync::Arc<retrieval::Embedder>>,
 }
 
 impl Memory {
@@ -127,7 +131,78 @@ impl Memory {
         Ok(Memory {
             conn: Mutex::new(conn),
             session_id,
+            embedder: None,
         })
+    }
+
+    pub async fn start_retrieval(&mut self) -> JumabekResult<usize> {
+        let embedder = std::sync::Arc::new(retrieval::Embedder::open()?);
+        self.embedder = Some(std::sync::Arc::clone(&embedder));
+        self.catch_up(&embedder).await
+    }
+
+    async fn catch_up(&self, embedder: &retrieval::Embedder) -> JumabekResult<usize> {
+        let mut done = 0;
+
+        loop {
+            let waiting = {
+                let conn = self.conn.lock().await;
+                facts::awaiting_vectors(&conn, EMBED_BATCH)?
+            };
+
+            if waiting.is_empty() {
+                return Ok(done);
+            }
+
+            let texts: Vec<String> = waiting.iter().map(|(_, text)| text.clone()).collect();
+            let vectors = embedder.embed(texts)?;
+
+            if vectors.len() != waiting.len() {
+                return Err(JumabekError::InternalError(format!(
+                    "asked for {} vectors and got {}",
+                    waiting.len(),
+                    vectors.len()
+                )));
+            }
+
+            let conn = self.conn.lock().await;
+            for ((id, _), vector) in waiting.iter().zip(vectors) {
+                facts::set_vector(&conn, *id, &retrieval::to_blob(&vector))?;
+            }
+
+            done += waiting.len();
+        }
+    }
+
+    pub async fn facts_for(
+        &self,
+        about: &str,
+        project: Option<&str>,
+    ) -> JumabekResult<Vec<facts::Fact>> {
+        let Some(embedder) = &self.embedder else {
+            return self.known_facts().await;
+        };
+
+        if about.trim().is_empty() {
+            return self.known_facts().await;
+        }
+
+        let mut query = embedder.embed(vec![about.to_string()])?;
+        let Some(query) = query.pop() else {
+            return self.known_facts().await;
+        };
+
+        let candidates = {
+            let conn = self.conn.lock().await;
+            facts::with_vectors(&conn, facts::LOCAL)?
+        };
+
+        Ok(retrieval::choose(
+            candidates,
+            &query,
+            project,
+            retrieval::KEPT,
+        ))
     }
 
     pub fn session_id(&self) -> i64 {
@@ -237,9 +312,9 @@ impl Memory {
         Ok(rows)
     }
 
-    pub async fn remember(&self, fact: &facts::Fact) -> JumabekResult<bool> {
+    pub async fn remember(&self, fact: &facts::Fact, also: bool) -> JumabekResult<facts::Written> {
         let conn = self.conn.lock().await;
-        facts::remember(&conn, fact)
+        facts::remember(&conn, fact, also)
     }
 
     pub async fn forget(&self, subject: &str, key: Option<&str>) -> JumabekResult<usize> {
@@ -297,6 +372,7 @@ fn migrate(conn: &Connection) -> JumabekResult<()> {
 
     if version < schema::SCHEMA_VERSION {
         conn.execute_batch(schema::DROP_LEGACY_INDEX)?;
+        rebuild_facts(conn)?;
         conn.execute_batch(schema::SCHEMA)?;
         add_missing_columns(conn)?;
         reindex(conn)?;
@@ -308,6 +384,34 @@ fn migrate(conn: &Connection) -> JumabekResult<()> {
             );
         }
         conn.execute_batch(&format!("PRAGMA user_version = {}", schema::SCHEMA_VERSION))?;
+    }
+
+    Ok(())
+}
+
+fn rebuild_facts(conn: &Connection) -> JumabekResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(facts)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if existing.is_empty() || existing.iter().any(|name| name == "owner") {
+        return Ok(());
+    }
+
+    let before: i64 = conn.query_row("SELECT count(*) FROM facts", [], |row| row.get(0))?;
+    drop(stmt);
+
+    conn.execute_batch(schema::REBUILD_FACTS)?;
+
+    let after: i64 = conn.query_row("SELECT count(*) FROM facts", [], |row| row.get(0))?;
+    if after < before {
+        eprintln!(
+            "[memory] warning: {} fact(s) went missing while widening the table",
+            before - after
+        );
+    } else if before > 0 {
+        eprintln!("[memory] {} fact(s) carried over to the wider table", after);
     }
 
     Ok(())

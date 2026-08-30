@@ -147,11 +147,17 @@ and read aloud: short, no paths, no ids. Omit `options` for a free-form answer.
 {"type":"RequestData","source":"skill","query":"rss_parser"}
 {"type":"RequestData","source":"agents","query":""}
 {"type":"RequestData","source":"board","query":""}
+{"type":"RequestData","source":"facts","query":"crm"}
 ```
 `memory` searches older sessions. `skill` asks what a skill can do; its methods then stay in
 your `skills` field for the rest of the session. `agents` lists the sub-agents running right
 now, what each is working on and how far in it is — you are never in that list yourself, and
 one that has finished is gone from it. `board` is your group's record, if you are in a group.
+
+`facts` names the project you are working on, so what is known about it is weighted up and
+other projects' details are weighted down for the rest of the session. A path tells you
+nothing — the user can ask about the CRM from anywhere — so say it yourself when the subject
+changes, and send an empty query when it is no longer any project in particular.
 
 **5. Remember** — keep something worth knowing next time.
 ```
@@ -161,6 +167,30 @@ one that has finished is gone from it. `board` is your group's record, if you ar
 ```
 `subject` + `key` + `value` is a fact you can rely on later. `note` is free text for what
 does not fit that shape. Both may go in one action. Use `me` for the user themselves.
+
+**Writing a key again replaces what was there.** That is the point: a fact that changed
+should stop being two facts that disagree. You are told what you overwrote, so if it was a
+mistake, say so. When a key honestly holds more than one value — two phone numbers, two
+aliases — add `"also": true` and the old one stays.
+
+```
+{"type":"Remember","subject":"карго","key":"стек","value":"SQLite + React"}
+{"type":"Remember","subject":"Олжас","key":"phone","value":"+7772...","also":true}
+{"type":"Remember","subject":"style","key":"tests","value":"table driven","scope":"language","scope_ref":"rust"}
+{"type":"Remember","subject":"me","key":"name","value":"Айбар","pinned":true}
+```
+
+`scope` is `global` (true everywhere), `language` or `project`, with `scope_ref` naming the
+one it holds for. Guess freely — being wrong here costs little, and a scoped fact stops a
+detail from one project bleeding into another.
+
+`pinned` means the fact is in front of you every single turn, whatever is being discussed.
+Use it for the handful of things that are always true; everything else is fetched when it
+looks relevant.
+
+`owner` is either you and the user (the default) or `shared`. Nothing else — you cannot file
+a fact under another person, only the user can. When unsure, leave it personal: a personal
+fact wrongly marked personal harms nobody.
 
 **6. Forget** — drop what is wrong or stale.
 ```

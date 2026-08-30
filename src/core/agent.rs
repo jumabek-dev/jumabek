@@ -203,6 +203,7 @@ pub struct Agent {
     board: crate::core::board::Board,
     discussions: RwLock<std::collections::HashMap<String, u32>>,
     memberships: RwLock<std::collections::HashMap<String, String>>,
+    project: RwLock<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,7 @@ impl Agent {
             board,
             discussions: RwLock::new(std::collections::HashMap::new()),
             memberships: RwLock::new(std::collections::HashMap::new()),
+            project: RwLock::new(None),
         });
 
         let _ = agent.me.set(Arc::downgrade(&agent));
@@ -780,7 +782,12 @@ impl Agent {
     }
 
     async fn profile_block(&self, task: &TaskObject) -> String {
-        let facts = self.memory.known_facts().await.unwrap_or_default();
+        let project = self.project.read().await.clone();
+        let facts = self
+            .memory
+            .facts_for(&task.message, project.as_deref())
+            .await
+            .unwrap_or_default();
         let block = profile::block(&facts, &profile::read_notes());
 
         let fragment = self.role_prompt(task.role.as_ref()).await;
@@ -1643,6 +1650,57 @@ impl Agent {
                         continue;
                     }
 
+                    if source == "facts" {
+                        let named = query.trim().to_lowercase();
+                        *self.project.write().await = if named.is_empty() {
+                            None
+                        } else {
+                            Some(named.clone())
+                        };
+
+                        ui.show_status(&format!(
+                            "facts · {}",
+                            if named.is_empty() {
+                                "everything"
+                            } else {
+                                &named
+                            }
+                        ))
+                        .await?;
+
+                        let facts = self
+                            .memory
+                            .facts_for(
+                                if named.is_empty() {
+                                    &task.message
+                                } else {
+                                    &named
+                                },
+                                if named.is_empty() {
+                                    None
+                                } else {
+                                    Some(named.as_str())
+                                },
+                            )
+                            .await
+                            .unwrap_or_default();
+
+                        results.push(if named.is_empty() {
+                            format!(
+                                "[FACTS] no longer working on any project in particular.\n{}",
+                                crate::memory::facts::render(&facts)
+                            )
+                        } else {
+                            format!(
+                                "[FACTS] '{}' is the project you are on now; what is known about \
+                                 it is weighted up from here on.\n{}",
+                                named,
+                                crate::memory::facts::render(&facts)
+                            )
+                        });
+                        continue;
+                    }
+
                     if source == "board" {
                         let Some(group) = &task.group else {
                             results.push(
@@ -1690,7 +1748,7 @@ impl Agent {
 
                     if source != "memory" {
                         results.push(format!(
-                            "[ERROR] unknown data source '{}', only 'memory', 'skill', 'agents' and 'board' are supported",
+                            "[ERROR] unknown data source '{}', only 'memory', 'skill', 'facts', 'agents' and 'board' are supported",
                             source
                         ));
                         continue;
@@ -1735,8 +1793,24 @@ impl Agent {
                     key,
                     value,
                     note,
+                    owner,
+                    scope,
+                    scope_ref,
+                    pinned,
+                    also,
                 } => {
-                    let text = self.remember(ui, subject, key, value, note).await?;
+                    let wanted = Keeping {
+                        subject,
+                        key,
+                        value,
+                        note,
+                        owner,
+                        scope,
+                        scope_ref,
+                        pinned: *pinned,
+                        also: *also,
+                    };
+                    let text = self.remember(ui, &wanted).await?;
                     results.push(text);
                 }
 
@@ -2222,27 +2296,48 @@ impl Agent {
     async fn remember(
         &self,
         ui: &mut dyn UserInterface,
-        subject: &str,
-        key: &str,
-        value: &str,
-        note: &str,
+        wanted: &Keeping<'_>,
     ) -> JumabekResult<String> {
-        let mut saved: Vec<String> = Vec::new();
+        use crate::memory::facts::{Fact, Scope};
 
-        if !subject.trim().is_empty() && !key.trim().is_empty() && !value.trim().is_empty() {
-            self.memory
-                .remember(&crate::memory::facts::Fact {
-                    subject: subject.to_string(),
-                    key: key.to_string(),
-                    value: value.to_string(),
-                })
-                .await?;
-            saved.push(format!("{} {} = {}", subject, key, value));
+        let mut saved: Vec<String> = Vec::new();
+        let mut replaced: Vec<String> = Vec::new();
+
+        if !wanted.subject.trim().is_empty()
+            && !wanted.key.trim().is_empty()
+            && !wanted.value.trim().is_empty()
+        {
+            let Some(owner) = crate::memory::facts::owner_of(wanted.owner) else {
+                return Ok(format!(
+                    "[REMEMBER REFUSED] a fact is either yours or 'shared'; '{}' is neither. \
+                     Only the user can put a fact against somebody else.",
+                    wanted.owner
+                ));
+            };
+
+            let Some(scope) = Scope::parse(wanted.scope) else {
+                return Ok(format!(
+                    "[REMEMBER ERROR] '{}' is not a scope. Use global, language or project.",
+                    wanted.scope
+                ));
+            };
+
+            let mut fact = Fact::new(wanted.subject, wanted.key, wanted.value)
+                .owned_by(&owner)
+                .about(scope, wanted.scope_ref);
+            fact.pinned = wanted.pinned;
+
+            let written = self.memory.remember(&fact, wanted.also).await?;
+            replaced = written.replaced;
+            saved.push(format!(
+                "{} {} = {}",
+                wanted.subject, wanted.key, wanted.value
+            ));
         }
 
-        if !note.trim().is_empty() {
-            profile::append_note(note)?;
-            saved.push(note.trim().to_string());
+        if !wanted.note.trim().is_empty() {
+            profile::append_note(wanted.note)?;
+            saved.push(wanted.note.trim().to_string());
         }
 
         if saved.is_empty() {
@@ -2256,10 +2351,24 @@ impl Agent {
             ui.show_status(&format!("remember · {}", line)).await?;
         }
 
+        let overwritten = if replaced.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " It took the place of {} — say so if that was not what you meant.",
+                replaced
+                    .iter()
+                    .map(|old| format!("'{}'", first_line(old)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
         Ok(format!(
-            "[REMEMBERED] {}. This is in front of you from now on — do not tell the user you \
+            "[REMEMBERED] {}.{} This is in front of you from now on — do not tell the user you \
              saved it unless they asked.",
-            saved.join("; ")
+            saved.join("; "),
+            overwritten
         ))
     }
 
@@ -2937,6 +3046,18 @@ fn decide_grant(
         (true, false) => Verdict::SentUpward,
         (false, _) => Verdict::GrantedByMainAgent,
     }
+}
+
+struct Keeping<'a> {
+    subject: &'a str,
+    key: &'a str,
+    value: &'a str,
+    note: &'a str,
+    owner: &'a str,
+    scope: &'a str,
+    scope_ref: &'a str,
+    pinned: bool,
+    also: bool,
 }
 
 fn discussion_key(group: &str, a: &str, b: &str) -> String {

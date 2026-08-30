@@ -242,6 +242,18 @@ When a conversation outgrows the context window, the oldest exchanges are droppe
 task groups — never half of one, which would leave a result with no matching command — and
 replaced by a marker telling the model what it can still recall.
 
+Facts it chose to keep sit in front of it every turn. Writing a key again replaces what was
+there, so a fact that changed stops being two facts that disagree; when a key honestly holds
+two values, the model says so and both stay. A fact can be pinned so it is always present,
+and scoped to a language or a project so one project's details do not bleed into another.
+
+By default every fact is loaded every turn. Set `[memory] retrieval = true` to pick them by
+meaning instead: pinned ones always, then whatever is closest to what is being discussed.
+The model doing the picking runs on this machine and nothing leaves it. It is not in the
+released binaries — the ONNX runtime it needs has no build for every target we ship — so it
+takes `cargo build --release --features retrieval`, and `jumabek doctor` says plainly if the
+setting is on and the binary cannot do it.
+
 ### Sub-agents
 
 Some work is worth doing but not worth reading. Scanning forty log files fills a context

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -29,15 +29,22 @@ CREATE INDEX IF NOT EXISTS idx_messages_task    ON messages(task_id);
 
 CREATE TABLE IF NOT EXISTS facts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner      TEXT NOT NULL DEFAULT 'me',
+    scope      TEXT NOT NULL DEFAULT 'global',
+    scope_ref  TEXT NOT NULL DEFAULT '',
+    pinned     INTEGER NOT NULL DEFAULT 0,
     subject    TEXT NOT NULL,
     key        TEXT NOT NULL,
     value      TEXT NOT NULL,
+    vector     BLOB,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(subject, key, value)
+    UNIQUE(owner, scope, scope_ref, subject, key, value)
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
+CREATE INDEX IF NOT EXISTS idx_facts_identity
+    ON facts(owner, scope, scope_ref, subject, key);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,4 +103,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 pub const DROP_LEGACY_INDEX: &str = r#"
 DROP TRIGGER IF EXISTS messages_ai;
 DROP TABLE IF EXISTS messages_fts;
+"#;
+
+pub const REBUILD_FACTS: &str = r#"
+CREATE TABLE facts_v7 (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner      TEXT NOT NULL DEFAULT 'me',
+    scope      TEXT NOT NULL DEFAULT 'global',
+    scope_ref  TEXT NOT NULL DEFAULT '',
+    pinned     INTEGER NOT NULL DEFAULT 0,
+    subject    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    vector     BLOB,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner, scope, scope_ref, subject, key, value)
+);
+
+INSERT INTO facts_v7 (owner, scope, scope_ref, pinned, subject, key, value, created_at, updated_at)
+SELECT 'me', 'global', '', 0, subject, key, value, created_at, updated_at FROM facts;
+
+DROP TABLE facts;
+ALTER TABLE facts_v7 RENAME TO facts;
+
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
+CREATE INDEX IF NOT EXISTS idx_facts_identity
+    ON facts(owner, scope, scope_ref, subject, key);
 "#;

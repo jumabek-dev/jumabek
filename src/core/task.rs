@@ -336,6 +336,16 @@ pub enum ActionType {
         value: String,
         #[serde(default, deserialize_with = "flexible_string")]
         note: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        owner: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        scope: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        scope_ref: String,
+        #[serde(default)]
+        pinned: bool,
+        #[serde(default)]
+        also: bool,
     },
     #[serde(alias = "ForgetFact")]
     Forget {

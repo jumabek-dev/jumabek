@@ -52,6 +52,37 @@ impl Check {
     }
 }
 
+fn check_retrieval(config: &crate::configs::Config) -> Check {
+    let compiled = crate::memory::retrieval::Embedder::COMPILED_IN;
+
+    match (config.memory.retrieval, compiled) {
+        (false, _) => Check::new(
+            Level::Ok,
+            "memory",
+            "every fact is loaded every turn, nothing is ranked",
+        )
+        .with_hint(if compiled {
+            "set [memory] retrieval = true to pick facts by meaning instead"
+        } else {
+            "this build carries no embedding model; rebuild with --features retrieval to \
+             pick facts by meaning instead"
+        }),
+
+        (true, true) => Check::new(
+            Level::Ok,
+            "memory",
+            "facts are picked by meaning; the model runs locally",
+        ),
+
+        (true, false) => Check::new(
+            Level::Fail,
+            "memory",
+            "[memory] retrieval is on but this build carries no embedding model",
+        )
+        .with_hint("rebuild with --features retrieval, or set retrieval = false"),
+    }
+}
+
 pub fn summarise(checks: &[Check]) -> (usize, usize, usize) {
     let count = |level: Level| checks.iter().filter(|c| c.level == level).count();
     (count(Level::Ok), count(Level::Warn), count(Level::Fail))
@@ -114,6 +145,7 @@ pub async fn run() -> JumabekResult<Vec<Check>> {
     checks.extend(check_llm(config.as_ref()).await);
     if let Some(config) = config.as_ref() {
         checks.push(check_intelligence(config));
+        checks.push(check_retrieval(config));
     }
     for language in Language::ALL {
         checks.push(check_language(language).await);

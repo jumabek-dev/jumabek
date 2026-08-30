@@ -57,5 +57,9 @@ jobs:
       - name: build
         run: cargo build --workspace --locked
 
+      - name: build with retrieval
+        if: runner.os == 'Linux'
+        run: cargo build --locked --features retrieval
+
       - name: test
         run: cargo test --workspace --locked

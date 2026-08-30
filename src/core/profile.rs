@@ -96,11 +96,7 @@ mod tests {
     use super::*;
 
     fn fact(subject: &str, key: &str, value: &str) -> Fact {
-        Fact {
-            subject: subject.to_string(),
-            key: key.to_string(),
-            value: value.to_string(),
-        }
+        Fact::new(subject, key, value)
     }
 
     #[test]

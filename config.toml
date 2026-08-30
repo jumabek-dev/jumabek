@@ -1,6 +1,15 @@
 # JumaBek configuration
 
 [memory]
+# Pick facts by meaning instead of loading every one of them every turn. The
+# model runs on this machine and nothing leaves it, but the first run downloads
+# it and embeds what is already stored. Off means the old behaviour, unchanged.
+#
+# The released binaries are built without it: the ONNX runtime it needs has no
+# build for every target in the release matrix. Build with
+# `cargo build --release --features retrieval` to get it, and `jumabek doctor`
+# will say so plainly if this is on and the binary cannot do it.
+retrieval = false
 db_path = "~/.jumabek/jumabek.db"
 
 [llm]
