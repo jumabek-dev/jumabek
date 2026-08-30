@@ -44,7 +44,7 @@ const STALL_CORRECTION: &str = "Your last answer said is_done: false but sent no
      action. Either send a real action (ExecuteModule, PromptToUser, SpawnAgent, ...) this turn, \
      or set is_done: true if you are actually finished.";
 
-const CAPABILITIES: [&str; 16] = [
+pub const CAPABILITIES: [&str; 16] = [
     "ExecuteModule",
     "PermissionRequest",
     "PromptToUser",

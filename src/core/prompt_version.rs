@@ -215,6 +215,64 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn how_big_is_the_prompt() {
+        let text = match std::env::var("COUNT_PROMPT") {
+            Ok(path) => std::fs::read_to_string(path).expect("cannot read it"),
+            Err(_) => RELEASE.to_string(),
+        };
+        println!(
+            "{} chars, {} tokens",
+            text.len(),
+            crate::token_counter::count_message("system", &text)
+        );
+    }
+
+    #[test]
+    fn every_action_the_prompt_shows_still_parses() {
+        let mut examples: Vec<String> = Vec::new();
+        let mut building: Option<String> = None;
+
+        for line in RELEASE.lines().map(str::trim) {
+            match &mut building {
+                Some(so_far) => {
+                    so_far.push(' ');
+                    so_far.push_str(line);
+                }
+                None if line.starts_with(r#"{"type":"#) => building = Some(line.to_string()),
+                None => continue,
+            }
+
+            let open = building.as_deref().unwrap_or_default();
+            if open.matches('{').count() == open.matches('}').count() {
+                examples.push(building.take().unwrap_or_default());
+            }
+        }
+
+        assert!(
+            examples.len() > 15,
+            "only found {} examples; the scan is broken",
+            examples.len()
+        );
+
+        for example in &examples {
+            serde_json::from_str::<crate::core::task::ActionType>(example).unwrap_or_else(|e| {
+                panic!("the prompt shows an action the code cannot read:\n  {example}\n  {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn the_prompt_names_every_action_the_code_accepts() {
+        for capability in crate::core::agent::CAPABILITIES {
+            assert!(
+                RELEASE.contains(capability),
+                "{capability} is offered to the model and never explained"
+            );
+        }
+    }
+
+    #[test]
     fn the_shipped_prompt_is_the_real_one() {
         assert!(
             RELEASE.contains("You are JumaBek"),
