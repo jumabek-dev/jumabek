@@ -24,14 +24,27 @@ impl Notifier for PlainNotifier {
     }
 }
 
+/// Everything that speaks from a background task — a job, an agent working on
+/// its own, the inbox — goes through here, and none of it is allowed to land in
+/// the middle of an answer being written to the screen. While the gate is held
+/// the lines queue up in the order they were said, and they are let out in that
+/// order once the screen is free.
 pub struct SharedNotifier {
     inner: std::sync::RwLock<Arc<dyn Notifier>>,
+    held: std::sync::atomic::AtomicUsize,
+    queued: std::sync::Mutex<Vec<String>>,
+    dropped: std::sync::atomic::AtomicBool,
 }
+
+const QUEUE_LIMIT: usize = 200;
 
 impl SharedNotifier {
     pub fn new(inner: Arc<dyn Notifier>) -> Self {
         SharedNotifier {
             inner: std::sync::RwLock::new(inner),
+            held: std::sync::atomic::AtomicUsize::new(0),
+            queued: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -40,10 +53,43 @@ impl SharedNotifier {
             *current = next;
         }
     }
-}
 
-impl Notifier for SharedNotifier {
-    fn notify(&self, text: String) {
+    /// Nothing reaches the screen until the matching `release`. Holds nest, so a
+    /// turn inside a turn does not open the gate early.
+    pub fn hold(&self) {
+        self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn release(&self) {
+        let before = self.held.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if before <= 1 {
+            self.flush();
+        }
+    }
+
+    pub fn flush(&self) {
+        let waiting: Vec<String> = match self.queued.lock() {
+            Ok(mut queued) => std::mem::take(&mut *queued),
+            Err(_) => return,
+        };
+
+        if self
+            .dropped
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.say(HELD_BACK.to_string());
+        }
+
+        for line in waiting {
+            self.say(line);
+        }
+    }
+
+    fn holding(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    fn say(&self, text: String) {
         let current = match self.inner.read() {
             Ok(current) => Arc::clone(&current),
             Err(_) => return,
@@ -51,6 +97,32 @@ impl Notifier for SharedNotifier {
         current.notify(text);
     }
 }
+
+impl Notifier for SharedNotifier {
+    fn notify(&self, text: String) {
+        if !self.holding() {
+            self.say(text);
+            return;
+        }
+
+        let Ok(mut queued) = self.queued.lock() else {
+            return;
+        };
+
+        // Something shouting must not grow the queue without end. Keep the
+        // newest, drop the oldest, and say once that some were dropped — the
+        // one thing worse than late news is news that vanished quietly.
+        while queued.len() >= QUEUE_LIMIT {
+            queued.remove(0);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        queued.push(text);
+    }
+}
+
+const HELD_BACK: &str = "  · some earlier background lines were dropped, too many at once";
 
 struct DetachedUi {
     notifier: Arc<dyn Notifier>,
@@ -244,6 +316,87 @@ mod tests {
             notifier: collector,
             label: "job 7 · watcher".to_string(),
         }
+    }
+
+    #[test]
+    fn nothing_reaches_the_screen_while_the_gate_is_held() {
+        let collector = Arc::new(Collector {
+            lines: StdMutex::new(Vec::new()),
+        });
+        let shared = SharedNotifier::new(Arc::clone(&collector) as Arc<dyn Notifier>);
+
+        shared.hold();
+        shared.notify("a job spoke".to_string());
+        shared.notify("and again".to_string());
+
+        assert!(
+            collector.lines.lock().unwrap().is_empty(),
+            "a background line landed in the middle of an answer"
+        );
+
+        shared.release();
+        let said = collector.lines.lock().unwrap();
+        assert_eq!(
+            said.as_slice(),
+            ["a job spoke".to_string(), "and again".to_string()],
+            "the queue came out in the wrong order"
+        );
+    }
+
+    #[test]
+    fn a_turn_inside_a_turn_does_not_open_the_gate_early() {
+        let collector = Arc::new(Collector {
+            lines: StdMutex::new(Vec::new()),
+        });
+        let shared = SharedNotifier::new(Arc::clone(&collector) as Arc<dyn Notifier>);
+
+        shared.hold();
+        shared.hold();
+        shared.notify("waiting".to_string());
+        shared.release();
+
+        assert!(
+            collector.lines.lock().unwrap().is_empty(),
+            "the inner release let it out while the outer turn was still going"
+        );
+
+        shared.release();
+        assert_eq!(collector.lines.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_open_gate_passes_everything_straight_through() {
+        let collector = Arc::new(Collector {
+            lines: StdMutex::new(Vec::new()),
+        });
+        let shared = SharedNotifier::new(Arc::clone(&collector) as Arc<dyn Notifier>);
+
+        shared.notify("idle chatter".to_string());
+        assert_eq!(collector.lines.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_flood_is_capped_and_says_that_it_was() {
+        let collector = Arc::new(Collector {
+            lines: StdMutex::new(Vec::new()),
+        });
+        let shared = SharedNotifier::new(Arc::clone(&collector) as Arc<dyn Notifier>);
+
+        shared.hold();
+        for n in 0..QUEUE_LIMIT + 50 {
+            shared.notify(format!("line {n}"));
+        }
+        shared.release();
+
+        let said = collector.lines.lock().unwrap();
+        assert!(said.len() <= QUEUE_LIMIT + 1, "the queue grew without end");
+        assert_eq!(said.first().map(|l| l.as_str()), Some(HELD_BACK));
+        assert!(
+            said.last()
+                .unwrap()
+                .contains(&format!("line {}", QUEUE_LIMIT + 49)),
+            "the newest line was dropped instead of the oldest"
+        );
     }
 
     #[tokio::test]

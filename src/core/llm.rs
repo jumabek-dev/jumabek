@@ -42,6 +42,7 @@ pub struct LlmClient {
     max_retries: u32,
     initial_delay_ms: u64,
     cache_markers: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,8 @@ pub struct Answer {
     pub usage: Option<crate::core::usage::Usage>,
 }
 
+pub type Watcher = tokio::sync::mpsc::UnboundedSender<String>;
+
 impl LlmClient {
     pub fn new(config: &Config) -> JumabekResult<Self> {
         let http = reqwest::Client::builder()
@@ -94,6 +97,7 @@ impl LlmClient {
             max_retries: config.llm.retry_max_retries.max(1),
             initial_delay_ms: config.llm.retry_initial_delay_ms,
             cache_markers: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -102,7 +106,16 @@ impl LlmClient {
         messages: &[LlmMessage],
         target: &RequestTarget,
     ) -> JumabekResult<LlmReply> {
-        let answer = self.request(messages, target).await?;
+        self.ask_watched(messages, target, None).await
+    }
+
+    pub async fn ask_watched(
+        &self,
+        messages: &[LlmMessage],
+        target: &RequestTarget,
+        watcher: Option<Watcher>,
+    ) -> JumabekResult<LlmReply> {
+        let answer = self.request(messages, target, watcher).await?;
         let response = parse_agent_response(&answer.content)?;
         Ok(LlmReply {
             response,
@@ -121,29 +134,46 @@ impl LlmClient {
             LlmMessage::new("system", system),
             LlmMessage::new("user", user),
         ];
-        Ok(self.request(&messages, target).await?.content)
+        Ok(self.request(&messages, target, None).await?.content)
     }
 
     async fn request(
         &self,
         messages: &[LlmMessage],
         target: &RequestTarget,
+        watcher: Option<Watcher>,
     ) -> JumabekResult<Answer> {
         let mut marking = self
             .cache_markers
             .load(std::sync::atomic::Ordering::Relaxed);
-        let mut body = self.body_for(messages, target, marking);
+        let mut flowing = self.streaming.load(std::sync::atomic::Ordering::Relaxed);
+        let mut body = self.body_for(messages, target, marking, flowing);
 
         let mut last_error = JumabekError::LlmUnavailable("no attempt was made".to_string());
 
         for attempt in 0..self.max_retries {
-            match self.attempt(&body, target).await {
+            let outcome = if flowing {
+                self.attempt_streaming(&body, target, watcher.as_ref())
+                    .await
+            } else {
+                self.attempt(&body, target).await
+            };
+
+            match outcome {
                 Ok(answer) => return Ok(answer),
                 Err(AttemptError::Fatal(e)) if marking && refused_the_marker(&e) => {
                     self.cache_markers
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     marking = false;
-                    body = self.body_for(messages, target, false);
+                    body = self.body_for(messages, target, false, flowing);
+                    last_error = e;
+                    continue;
+                }
+                Err(AttemptError::Fatal(e)) if flowing && refused_the_flow(&e) => {
+                    self.streaming
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    flowing = false;
+                    body = self.body_for(messages, target, marking, false);
                     last_error = e;
                     continue;
                 }
@@ -165,11 +195,136 @@ impl LlmClient {
         messages: &[LlmMessage],
         target: &RequestTarget,
         mark_cache: bool,
+        flowing: bool,
     ) -> serde_json::Value {
-        match target.protocol {
+        let mut body = match target.protocol {
             Protocol::OpenAi => build_openai_body(messages, target, mark_cache),
             Protocol::Anthropic => build_anthropic_body(messages, target, mark_cache),
+        };
+        body["stream"] = serde_json::Value::Bool(flowing);
+        body
+    }
+
+    async fn attempt_streaming(
+        &self,
+        body: &serde_json::Value,
+        target: &RequestTarget,
+        watcher: Option<&Watcher>,
+    ) -> Result<Answer, AttemptError> {
+        use futures::StreamExt;
+
+        let response = self.send(body, target).await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_status(status, &text));
         }
+
+        let mut assembler = crate::core::stream::Assembler::new(target.protocol);
+        let mut chunks = response.bytes_stream();
+        let mut whole_body = String::new();
+
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|e| {
+                AttemptError::Retryable(JumabekError::LlmUnavailable(format!(
+                    "the answer stopped part way through: {}",
+                    e
+                )))
+            })?;
+
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            whole_body.push_str(&text);
+
+            if let Some(fresh) = assembler.feed(&text)
+                && let Some(watcher) = watcher
+            {
+                let _ = watcher.send(fresh);
+            }
+        }
+
+        // Some endpoints accept `stream: true` and answer with an ordinary body
+        // anyway. That is a whole answer, not a broken one, so read it as one.
+        if !assembler.saw_any_events() {
+            let content =
+                extract_content(&whole_body, target.protocol).map_err(AttemptError::Retryable)?;
+
+            if let Some(watcher) = watcher
+                && let Some(message) = crate::core::stream::visible_message(&content)
+            {
+                let _ = watcher.send(message);
+            }
+
+            return Ok(Answer {
+                content,
+                usage: crate::core::usage::parse(&whole_body),
+            });
+        }
+
+        // A stream that stopped without its terminator was cut short, and what
+        // arrived is half an answer. Asking again is better than parsing it.
+        let finished = assembler.saw_the_end();
+        let (content, usage) = assembler.finish();
+
+        if content.trim().is_empty() {
+            return Err(AttemptError::Retryable(JumabekError::LlmInvalidResponse(
+                "the model streamed nothing back".to_string(),
+            )));
+        }
+
+        if !finished {
+            return Err(AttemptError::Retryable(JumabekError::LlmInvalidResponse(
+                format!(
+                    "the answer was cut off after {} characters with no end marker",
+                    content.chars().count()
+                ),
+            )));
+        }
+
+        Ok(Answer { content, usage })
+    }
+
+    async fn send(
+        &self,
+        body: &serde_json::Value,
+        target: &RequestTarget,
+    ) -> Result<reqwest::Response, AttemptError> {
+        let mut request = self
+            .http
+            .post(&target.endpoint)
+            .header(CONTENT_TYPE, "application/json");
+
+        request = match target.protocol {
+            Protocol::OpenAi => {
+                if target.api_key.is_empty() {
+                    request
+                } else {
+                    request.header(AUTHORIZATION, format!("Bearer {}", target.api_key))
+                }
+            }
+            Protocol::Anthropic => {
+                let key = if target.api_key.is_empty() {
+                    "ollama"
+                } else {
+                    target.api_key.as_str()
+                };
+                request
+                    .header("x-api-key", key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            }
+        };
+
+        request.json(body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                AttemptError::Retryable(JumabekError::LlmTimeout(e.to_string()))
+            } else {
+                AttemptError::Retryable(JumabekError::LlmUnavailable(format!(
+                    "{} — nothing is answering at {}. Check that the endpoint is running \
+                     and that [llm].base_uri points at it.",
+                    e, target.endpoint
+                )))
+            }
+        })
     }
 
     async fn attempt(
@@ -351,6 +506,10 @@ fn build_anthropic_body(
     }
 
     body
+}
+
+fn refused_the_flow(error: &JumabekError) -> bool {
+    error.to_string().to_lowercase().contains("stream")
 }
 
 fn refused_the_marker(error: &JumabekError) -> bool {
@@ -556,6 +715,19 @@ fn extract_anthropic_content(raw: &serde_json::Value, body: &str) -> JumabekResu
 
 pub fn parse_agent_response(content: &str) -> JumabekResult<AgentResponse> {
     let payload = json_repair::extract_json_payload(content);
+
+    if let Ok(response) = serde_json::from_str::<AgentResponse>(&payload) {
+        return Ok(response);
+    }
+
+    // A model writing markdown into a JSON string leaves backslashes JSON cannot
+    // read. Try again with those escaped rather than spending a turn asking.
+    let mended = json_repair::repair_escapes(&payload);
+    if mended != payload
+        && let Ok(response) = serde_json::from_str::<AgentResponse>(&mended)
+    {
+        return Ok(response);
+    }
 
     serde_json::from_str::<AgentResponse>(&payload).map_err(|e| {
         if json_repair::looks_truncated(content) {

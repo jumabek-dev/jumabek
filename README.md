@@ -593,9 +593,21 @@ Inside a session, `/voice` and `/cli` switch modes without losing the conversati
 `/quit` leaves. Shift+Enter starts a new line without submitting — Alt+Enter does the same
 on terminals that do not report modifier keys.
 
+When an agent working on its own needs something from you, `/waiting` lists what is
+outstanding, `/allow <id>` and `/deny <id>` settle a permission, and `/answer <id> <text>`
+answers a question. It rings the terminal when one arrives, reminds you a minute before it
+gives up, and says plainly when one went unanswered — a question that dies quietly is worse
+than one that was refused.
+
 Answers are rendered, not printed: headings, lists, tables, code blocks and emphasis all
-arrive as terminal formatting rather than raw asterisks. Your turn and the agent's are
-told apart by a chip against a solid left bar, so a long session stays readable.
+arrive as terminal formatting rather than raw asterisks, and they appear as they are written
+rather than in one lump at the end. Your turn and the agent's are told apart by a chip
+against a solid left bar, so a long session stays readable.
+
+Nothing from a background job, an agent working on its own, or the inbox is allowed to land
+in the middle of an answer. It waits and comes out afterwards, in the order it was said. When
+one does arrive while you are typing, it is printed above your line and your half-written
+input is redrawn underneath, untouched.
 
 ### When voice does not hear you
 

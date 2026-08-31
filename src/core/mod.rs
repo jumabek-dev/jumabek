@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agents;
+pub mod asking;
 pub mod board;
 pub mod chunks;
 pub mod context;
@@ -17,6 +18,7 @@ pub mod reload;
 pub mod safety;
 pub mod scheduler;
 pub mod self_improvement;
+pub mod stream;
 pub mod task;
 pub mod usage;
 pub mod validator;

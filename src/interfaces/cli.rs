@@ -55,6 +55,107 @@ impl Helper for Prompt {}
 
 pub struct Cli {
     editor: Editor<Prompt, DefaultHistory>,
+    live: Live,
+}
+
+/// The tail of an answer being repainted while it arrives. It never grows past
+/// what fits on screen: there is nothing to move the cursor back up to above the
+/// top of the terminal, so the live region stays bounded and the finished answer
+/// is printed in full afterwards.
+#[derive(Default)]
+struct Live {
+    on_screen: Vec<String>,
+    last_paint: Option<std::time::Instant>,
+}
+
+const REPAINT_EVERY: std::time::Duration = std::time::Duration::from_millis(70);
+const ROOM_FOR_THE_REST: usize = 6;
+
+fn terminal_height() -> usize {
+    terminal_size::terminal_size()
+        .map(|(_, terminal_size::Height(h))| h as usize)
+        .unwrap_or(24)
+}
+
+impl Live {
+    fn reset(&mut self) {
+        self.on_screen.clear();
+        self.last_paint = None;
+    }
+
+    fn window(&self, text: &str) -> Vec<String> {
+        let all = drawn_lines(text);
+        let room = terminal_height().saturating_sub(ROOM_FOR_THE_REST).max(3);
+
+        if all.len() > room {
+            all[all.len() - room..].to_vec()
+        } else {
+            all
+        }
+    }
+
+    /// Redraw from the first line that differs. For text that grows at the end
+    /// that is the last line or two; when the window has scrolled it is all of
+    /// them, which is still at most one screen.
+    fn paint(&mut self, text: &str, force: bool) {
+        if !force
+            && let Some(last) = self.last_paint
+            && last.elapsed() < REPAINT_EVERY
+        {
+            return;
+        }
+
+        let wanted = self.window(text);
+
+        let same = wanted
+            .iter()
+            .zip(&self.on_screen)
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        let redraw = self.on_screen.len().saturating_sub(same);
+        if redraw > 0 {
+            print!("\x1b[{}A", redraw);
+        }
+        print!("\x1b[J");
+
+        for line in wanted.iter().skip(same) {
+            println!("{}", line);
+        }
+
+        flush();
+        self.on_screen = wanted;
+        self.last_paint = Some(std::time::Instant::now());
+    }
+
+    fn wipe(&mut self) {
+        if !self.on_screen.is_empty() {
+            print!("\x1b[{}A\x1b[J", self.on_screen.len());
+            flush();
+        }
+        self.on_screen.clear();
+    }
+}
+
+fn flush() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+fn drawn_lines(text: &str) -> Vec<String> {
+    let (r, g, b) = BAR;
+    let bar = "▌".truecolor(r, g, b).to_string();
+
+    let mut out = vec![String::new()];
+    for line in markdown::render(text, body_width().saturating_sub(2)) {
+        if line.is_empty() {
+            out.push(format!("{}{}", INDENT, bar));
+        } else {
+            out.push(format!("{}{} {}", INDENT, bar, line));
+        }
+    }
+    out.push(String::new());
+    out
 }
 
 struct LinePrinter {
@@ -91,7 +192,10 @@ impl Cli {
             editor.bind_sequence(key, EventHandler::Simple(Cmd::Insert(1, "\n".to_string())));
         }
 
-        Ok(Cli { editor })
+        Ok(Cli {
+            editor,
+            live: Live::default(),
+        })
     }
 
     pub fn notifier(&mut self) -> Option<std::sync::Arc<dyn Notifier>> {
@@ -180,19 +284,44 @@ impl UserInterface for Cli {
     }
 
     async fn show_response(&mut self, text: &str) -> JumabekResult<()> {
-        let (r, g, b) = BAR;
-        let bar = "▌".truecolor(r, g, b).to_string();
+        for line in drawn_lines(text) {
+            println!("{}", line);
+        }
+        Ok(())
+    }
 
-        println!();
-        for line in markdown::render(text, body_width().saturating_sub(2)) {
-            if line.is_empty() {
-                println!("{}{}", INDENT, bar);
-            } else {
-                println!("{}{} {}", INDENT, bar, line);
+    async fn stream_begin(&mut self) -> JumabekResult<()> {
+        self.live.reset();
+        Ok(())
+    }
+
+    async fn stream_update(&mut self, whole: &str) -> JumabekResult<()> {
+        if !whole.trim().is_empty() {
+            self.live.paint(whole, false);
+        }
+        Ok(())
+    }
+
+    async fn stream_end(&mut self, keep: Option<&str>) -> JumabekResult<()> {
+        // Whatever was live is only ever the tail. Clear it and print the whole
+        // answer, so what is left on screen is the same as one that was never
+        // streamed at all.
+        self.live.wipe();
+        self.live.reset();
+
+        if let Some(text) = keep
+            && !text.trim().is_empty()
+        {
+            for line in drawn_lines(text) {
+                println!("{}", line);
             }
         }
-        println!();
+
         Ok(())
+    }
+
+    fn streams(&self) -> bool {
+        true
     }
 
     async fn show_status(&mut self, text: &str) -> JumabekResult<()> {

@@ -73,6 +73,7 @@ fn short_name(action: &ActionType) -> &str {
         ActionType::PostToBoard { .. } => "board",
         ActionType::AskAgent { .. } => "ask agent",
         ActionType::RequestGrant { .. } => "rights",
+        ActionType::Decide { .. } => "decide",
     }
 }
 

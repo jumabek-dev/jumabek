@@ -17,6 +17,49 @@ pub fn extract_json_payload(content: &str) -> String {
     escape_raw_control_chars_in_strings(&candidate)
 }
 
+/// Markdown is full of backslashes — `\|` inside a table, `\*` before a
+/// literal asterisk — and a model writing markdown into a JSON string routinely
+/// emits them unescaped, which makes the whole answer unreadable. Escape the
+/// ones JSON does not recognise and leave every real escape alone.
+pub fn repair_escapes(payload: &str) -> String {
+    let mut out = String::with_capacity(payload.len());
+    let mut chars = payload.chars().peekable();
+    let mut inside_string = false;
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            inside_string = !inside_string;
+            out.push(c);
+            continue;
+        }
+
+        if c != '\\' || !inside_string {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('u') => {
+                let rest: String = chars.clone().skip(1).take(4).collect();
+                if rest.len() == 4 && rest.chars().all(|h| h.is_ascii_hexdigit()) {
+                    out.push('\\');
+                } else {
+                    out.push_str("\\\\");
+                }
+            }
+
+            // A backslash that ends the payload cannot be a real escape.
+            None => out.push_str("\\\\"),
+
+            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => out.push('\\'),
+
+            Some(_) => out.push_str("\\\\"),
+        }
+    }
+
+    out
+}
+
 pub fn looks_truncated(content: &str) -> bool {
     let without_reasoning = strip_reasoning(content.trim());
     let trimmed = strip_code_fence(without_reasoning.trim());
@@ -145,6 +188,47 @@ fn escape_raw_control_chars_in_strings(json: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backslash_markdown_uses_is_escaped_so_the_answer_can_be_read() {
+        let broken = r#"{"message":"a \| b and \* c"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(broken).is_err());
+
+        let mended = repair_escapes(broken);
+        let read: serde_json::Value = serde_json::from_str(&mended).expect("still unreadable");
+        assert_eq!(read["message"], "a \\| b and \\* c");
+    }
+
+    #[test]
+    fn every_escape_json_really_has_is_left_alone() {
+        let fine = r#"{"message":"line\ntab\tquote\"slash\\ unicode\u0416"}"#;
+        let read: serde_json::Value = serde_json::from_str(fine).expect("the fixture is wrong");
+
+        assert_eq!(repair_escapes(fine), fine, "a valid escape was mangled");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&repair_escapes(fine)).unwrap(),
+            read
+        );
+    }
+
+    #[test]
+    fn a_half_written_unicode_escape_is_treated_as_a_plain_backslash() {
+        let broken = r#"{"message":"cost \u20 only"}"#;
+        let read: serde_json::Value =
+            serde_json::from_str(&repair_escapes(broken)).expect("still unreadable");
+        assert_eq!(read["message"], "cost \\u20 only");
+    }
+
+    #[test]
+    fn a_backslash_outside_a_string_is_not_touched() {
+        let payload = r#"{"a":1} \ {"b":2}"#;
+        assert_eq!(repair_escapes(payload), payload);
+    }
+
+    #[test]
+    fn a_payload_ending_on_a_backslash_does_not_run_off_the_end() {
+        assert_eq!(repair_escapes(r#"{"m":"x\"#), r#"{"m":"x\\"#);
+    }
 
     fn parses(s: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(s).is_ok()

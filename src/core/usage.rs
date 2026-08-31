@@ -44,6 +44,10 @@ pub fn parse(body: &str) -> Option<Usage> {
     from_value(raw.get("usage")?)
 }
 
+pub fn from_json(usage: Option<&serde_json::Value>) -> Option<Usage> {
+    from_value(usage?)
+}
+
 fn from_value(usage: &serde_json::Value) -> Option<Usage> {
     let number = |name: &str| usage.get(name).and_then(|n| n.as_u64()).map(|n| n as u32);
 

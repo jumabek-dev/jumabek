@@ -412,6 +412,17 @@ pub enum ActionType {
         #[serde(default, deserialize_with = "flexible_string")]
         message: String,
     },
+    #[serde(alias = "Verdict", alias = "AllowOrRefuse")]
+    Decide {
+        #[serde(default, deserialize_with = "flexible_string")]
+        id: String,
+        #[serde(default)]
+        allow: bool,
+        #[serde(default, deserialize_with = "flexible_string")]
+        answer: String,
+        #[serde(default, deserialize_with = "flexible_string")]
+        why: String,
+    },
     #[serde(
         alias = "AskForGrant",
         alias = "ExpandGrant",
@@ -474,6 +485,18 @@ impl ActionType {
             ActionType::PostToBoard { kind, .. } => format!("board · {}", kind),
             ActionType::AskAgent { to, .. } => format!("asking {}", to),
             ActionType::RequestGrant { why, .. } => format!("asking for rights · {}", why),
+            ActionType::Decide {
+                id, allow, answer, ..
+            } => {
+                let what = if !answer.trim().is_empty() {
+                    "answering"
+                } else if *allow {
+                    "allowing"
+                } else {
+                    "refusing"
+                };
+                format!("{} #{}", what, id)
+            }
             ActionType::GenerateChunk {
                 module_name,
                 chunk_index,

@@ -34,6 +34,11 @@ const REPORTS_KEPT: usize = 20;
 
 const THREAD_MESSAGES: u32 = 60;
 
+/// Rings the terminal, which badges the tab for somebody who is not looking.
+const BELL: &str = "\x07";
+
+const REMIND_BEFORE_GIVING_UP: std::time::Duration = std::time::Duration::from_secs(60);
+
 const PARSE_RETRIES: u32 = 2;
 
 const PARSE_CORRECTION: &str = "Your previous answer could not be read as an agent response and \
@@ -46,7 +51,7 @@ const STALL_CORRECTION: &str = "Your last answer said is_done: false but sent no
      action. Either send a real action (ExecuteModule, PromptToUser, SpawnAgent, ...) this turn, \
      or set is_done: true if you are actually finished.";
 
-pub const CAPABILITIES: [&str; 16] = [
+pub const CAPABILITIES: [&str; 17] = [
     "ExecuteModule",
     "PermissionRequest",
     "PromptToUser",
@@ -58,6 +63,7 @@ pub const CAPABILITIES: [&str; 16] = [
     "PostToBoard",
     "AskAgent",
     "RequestGrant",
+    "Decide",
     "ScheduleJob",
     "ManageJobs",
     "GenerateChunk",
@@ -206,6 +212,7 @@ pub struct Agent {
     discussions: RwLock<std::collections::HashMap<String, u32>>,
     memberships: RwLock<std::collections::HashMap<String, String>>,
     project: RwLock<Option<String>>,
+    waiting: crate::core::asking::Waiting,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +282,7 @@ impl Agent {
             discussions: RwLock::new(std::collections::HashMap::new()),
             memberships: RwLock::new(std::collections::HashMap::new()),
             project: RwLock::new(None),
+            waiting: crate::core::asking::Waiting::new(),
         });
 
         let _ = agent.me.set(Arc::downgrade(&agent));
@@ -562,7 +570,7 @@ impl Agent {
         job_task.parent_task_id = Some(thread_key(&origin));
         job_task.grant = Some(grant);
         job_task.origin = Some(origin);
-        self.run(&mut detached, job_task).await
+        Ok(self.run(&mut detached, job_task).await?.text)
     }
 
     pub async fn run_job(
@@ -575,7 +583,7 @@ impl Agent {
         let mut job_task = self.new_task(&uuid::Uuid::new_v4().to_string(), task).await;
         job_task.agent_id = format!("job:{}", job_id);
         job_task.grant = Some(grant);
-        self.run(ui, job_task).await
+        Ok(self.run(ui, job_task).await?.text)
     }
 
     pub async fn handle(&self, ui: &mut dyn UserInterface, request: String) -> JumabekResult<()> {
@@ -588,7 +596,7 @@ impl Agent {
         &'a self,
         ui: &'a mut dyn UserInterface,
         task: TaskObject,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = JumabekResult<String>> + Send + 'a>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = JumabekResult<Ended>> + Send + 'a>>
     {
         let caller = task.agent_id.clone();
         let parent = crate::skill_layer::current_caller();
@@ -600,7 +608,7 @@ impl Agent {
         ui: &mut dyn UserInterface,
         task: TaskObject,
         parent: Option<String>,
-    ) -> JumabekResult<String> {
+    ) -> JumabekResult<Ended> {
         let agent_id = task.agent_id.clone();
 
         self.agents
@@ -620,9 +628,9 @@ impl Agent {
         self.agents
             .finished(
                 &agent_id,
-                match outcome {
-                    Ok(_) => AgentState::Finished,
-                    Err(_) => AgentState::Failed,
+                match &outcome {
+                    Ok(ended) if ended.finished => AgentState::Finished,
+                    _ => AgentState::Failed,
                 },
             )
             .await;
@@ -638,7 +646,7 @@ impl Agent {
         &self,
         ui: &mut dyn UserInterface,
         mut task: TaskObject,
-    ) -> JumabekResult<String> {
+    ) -> JumabekResult<Ended> {
         let step = self.config.read().await.agent.max_iterations;
         let mut budget = step;
         let mut last_message = String::new();
@@ -669,7 +677,7 @@ impl Agent {
 
             if let Some(stop) = self.spend_group_iteration(&mut task).await {
                 ui.show_status(&stop).await?;
-                return Ok(stop);
+                return Ok(Ended::stopped(stop));
             }
 
             let history = self.history_for(&task).await?;
@@ -696,7 +704,10 @@ impl Agent {
                 .await?;
             }
 
-            let reply = self.ask_until_readable(ui, &built.messages).await?;
+            let drawn_live = ui.streams() && task.depth == 0;
+            let reply = self
+                .ask_until_readable(ui, &built.messages, drawn_live)
+                .await?;
             self.log_turn(&task, &reply.response, &reply.raw_content)
                 .await?;
 
@@ -738,7 +749,9 @@ impl Agent {
             if !reply.response.message.trim().is_empty() && !is_stall(&reply.response) {
                 last_message = reply.response.message.clone();
                 if task.depth == 0 {
-                    ui.show_response(&reply.response.message).await?;
+                    if !drawn_live {
+                        ui.show_response(&reply.response.message).await?;
+                    }
                 } else {
                     ui.show_status(&format!("subagent · {}", first_line(&last_message)))
                         .await?;
@@ -746,12 +759,12 @@ impl Agent {
             }
 
             match self.run_actions(ui, &task, &reply.response).await? {
-                StepOutcome::Finished => return Ok(last_message),
+                StepOutcome::Finished => return Ok(Ended::done(last_message)),
                 StepOutcome::Aborted(reason) => {
                     if task.depth == 0 {
                         ui.show_error(&reason).await?;
                     }
-                    return Ok(reason);
+                    return Ok(Ended::stopped(reason));
                 }
                 StepOutcome::Continue(system_response) => {
                     let mut escalated = false;
@@ -785,10 +798,10 @@ impl Agent {
                     task.iteration += 1;
                     if task.iteration >= budget {
                         if !self.ask_for_more_iterations(ui, &task, budget).await? {
-                            return Ok(format!(
+                            return Ok(Ended::stopped(format!(
                                 "stopped at {} iterations without finishing",
                                 budget
-                            ));
+                            )));
                         }
                         budget += step;
                         task.constraints.max_iterations = budget;
@@ -903,10 +916,60 @@ impl Agent {
         Ok(carry_on)
     }
 
+    /// Runs one request, painting the answer as it arrives when the interface
+    /// draws that way. The request future and the screen writes take turns on
+    /// this task, so no part of the interface has to be shared across threads.
+    async fn ask_once(
+        &self,
+        ui: &mut dyn UserInterface,
+        sent: &[crate::core::task::LlmMessage],
+        target: &crate::core::llm::RequestTarget,
+        live: bool,
+    ) -> JumabekResult<crate::core::llm::LlmReply> {
+        let client = self.llm.read().await.clone();
+
+        if !live {
+            return client.ask_as(sent, target).await;
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut whole = String::new();
+        let mut asking = Box::pin(client.ask_watched(sent, target, Some(tx)));
+
+        ui.stream_begin().await?;
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+
+                Some(fresh) = rx.recv() => {
+                    whole.push_str(&fresh);
+                    ui.stream_update(&whole).await?;
+                }
+
+                reply = &mut asking => break reply,
+            }
+        };
+
+        // The same rule the loop uses to decide whether an answer is worth
+        // showing, applied here so a stall is wiped rather than left on screen.
+        match &outcome {
+            Ok(reply)
+                if !reply.response.message.trim().is_empty() && !is_stall(&reply.response) =>
+            {
+                ui.stream_end(Some(&reply.response.message)).await?
+            }
+            _ => ui.stream_end(None).await?,
+        }
+
+        outcome
+    }
+
     async fn ask_until_readable(
         &self,
         ui: &mut dyn UserInterface,
         messages: &[crate::core::task::LlmMessage],
+        live: bool,
     ) -> JumabekResult<crate::core::llm::LlmReply> {
         let mut attempt = 0;
 
@@ -920,7 +983,7 @@ impl Agent {
             }
 
             let target = target_for(&*self.config.read().await, self.level().await);
-            match self.llm.read().await.clone().ask_as(&sent, &target).await {
+            match self.ask_once(ui, &sent, &target, live).await {
                 Ok(reply) => return Ok(reply),
                 Err(JumabekError::ParseError(detail)) if attempt < PARSE_RETRIES => {
                     attempt += 1;
@@ -1213,6 +1276,114 @@ impl Agent {
             allowed.saturating_sub(spent),
             allowed
         )
+    }
+
+    /// A detached agent cannot reach a keyboard, but it is not on its own. The
+    /// request goes to whoever spawned it and to the person at the terminal, and
+    /// the agent waits for one of them. Nobody answering is a refusal — silence
+    /// must never read as consent.
+    /// A detached agent cannot reach a keyboard, but it is not on its own. The
+    /// request goes to whoever spawned it and to the person at the terminal, and
+    /// the agent waits for one of them. Nobody answering settles nothing: a
+    /// permission is refused and a question comes back unanswered.
+    async fn ask_upward(
+        &self,
+        task: &TaskObject,
+        ask: crate::core::asking::Ask,
+    ) -> Option<crate::core::asking::Reply> {
+        use crate::core::asking::Wanted;
+
+        let wanted = Wanted {
+            id: short_id(&uuid::Uuid::new_v4().to_string()),
+            asked_by: task.agent_id.clone(),
+            role: task.role.clone(),
+            ask,
+        };
+
+        let id = wanted.id.clone();
+        let said = wanted.line();
+        let how = wanted.how_to_answer();
+        let tag = if wanted.wants_words() {
+            "QUESTION ASKED"
+        } else {
+            "PERMISSION ASKED"
+        };
+        let answer = self.waiting.open(wanted).await;
+
+        // The bell is what reaches somebody who has walked away: terminals
+        // badge the tab or flash for it, and nothing else here can.
+        self.tell(format!("{}  ? {} · {}", BELL, said, how));
+
+        if let Some(parent) = self.parent_of(&task.agent_id).await {
+            self.leave_report(
+                &parent,
+                format!(
+                    "[{}] {}. You spawned it, so this is yours to settle: answer with Decide, \
+                     or put it to the user yourself first if you are not sure. It is stopped \
+                     until you do.\n  id: {}",
+                    tag, said, id
+                ),
+            )
+            .await;
+        }
+
+        let patience =
+            std::time::Duration::from_secs(self.config.read().await.inbox.ask_timeout_sec.max(30));
+
+        self.wait_for_an_answer(answer, &id, &said, &how, patience)
+            .await
+    }
+
+    /// Waits, reminding once before giving up. A question that dies quietly is
+    /// worse than one that was refused: the person never learns it was asked.
+    async fn wait_for_an_answer(
+        &self,
+        answer: tokio::sync::oneshot::Receiver<crate::core::asking::Reply>,
+        id: &str,
+        said: &str,
+        how: &str,
+        patience: std::time::Duration,
+    ) -> Option<crate::core::asking::Reply> {
+        let mut answer = answer;
+        let remind_after = patience.saturating_sub(REMIND_BEFORE_GIVING_UP);
+
+        let waited = tokio::select! {
+            reply = &mut answer => return reply.ok(),
+            _ = tokio::time::sleep(remind_after) => remind_after,
+        };
+
+        let left = patience.saturating_sub(waited);
+        self.tell(format!(
+            "{}  ? still waiting · {} · {} · giving up in {}s",
+            BELL,
+            said,
+            how,
+            left.as_secs()
+        ));
+
+        match tokio::time::timeout(left, answer).await {
+            Ok(Ok(reply)) => Some(reply),
+            _ => {
+                self.waiting.close(id).await;
+                self.tell(format!(
+                    "{}  x nobody answered in {}s, so it went unanswered: {}. Whoever asked \
+                     carried on without it.",
+                    BELL,
+                    patience.as_secs(),
+                    said
+                ));
+                None
+            }
+        }
+    }
+
+    pub async fn decide(&self, id: &str, reply: crate::core::asking::Reply) -> Option<String> {
+        let wanted = self.waiting.answer(id, reply).await?;
+        Some(wanted.line())
+    }
+
+    pub async fn outstanding(&self) -> Vec<crate::core::asking::Wanted> {
+        self.waiting.outstanding().await
     }
 
     async fn expand_grant(
@@ -1542,10 +1713,19 @@ impl Agent {
         let mut results: Vec<String> = Vec::new();
 
         for stage in &plan.stages {
+            // A refusal is a result, not the end of the task. An agent told it
+            // may not do something can finish with what it has and say so; one
+            // whose task is killed loses everything it did up to that point.
+            let mut refused = false;
             for action in stage_actions(stage) {
                 if let Some(refusal) = refuse_outside_grant(task, action) {
-                    return Ok(StepOutcome::Aborted(refusal));
+                    results.push(refusal);
+                    refused = true;
                 }
+            }
+
+            if refused {
+                continue;
             }
 
             for action in stage_actions(stage) {
@@ -1633,7 +1813,19 @@ impl Agent {
                     risk_level,
                 } => {
                     self.agents.waiting(&task.agent_id, true).await;
-                    let allowed = ui.ask_permission(action, description, risk_level).await?;
+
+                    let allowed = if nobody_to_ask(task) {
+                        use crate::core::asking::Ask;
+                        let asked = Ask::Permission {
+                            action: action.clone(),
+                            description: description.clone(),
+                            risk_level: risk_level.clone(),
+                        };
+                        crate::core::asking::granted(self.ask_upward(task, asked).await.as_ref())
+                    } else {
+                        ui.ask_permission(action, description, risk_level).await?
+                    };
+
                     self.agents.waiting(&task.agent_id, false).await;
                     let verdict = if allowed { "granted" } else { "denied" };
 
@@ -1659,6 +1851,34 @@ impl Agent {
 
                 ActionType::PromptToUser { message, options } => {
                     self.agents.waiting(&task.agent_id, true).await;
+
+                    // A copy working on its own has no keyboard, but the question
+                    // is still worth putting to somebody. It goes up and waits.
+                    if nobody_to_ask(task) {
+                        use crate::core::asking::{Ask, Reply};
+
+                        let asked = Ask::Question {
+                            message: message.clone(),
+                            options: options.iter().map(|o| o.label.clone()).collect(),
+                        };
+
+                        let heard = self.ask_upward(task, asked).await;
+                        self.agents.waiting(&task.agent_id, false).await;
+
+                        results.push(match heard {
+                            Some(Reply::Said(said)) => {
+                                self.memory
+                                    .log(NewMessage::new(Role::User, &said).task(&task.task_id))
+                                    .await?;
+                                format!("[USER] {}", said)
+                            }
+                            _ => "[NO ONE TO ASK] nobody answered in time. Decide it yourself \
+                                  from what you have, state the assumption, and carry on."
+                                .to_string(),
+                        });
+                        continue;
+                    }
+
                     let answer = if options.is_empty() {
                         ui.show_response(message).await?;
                         match ui.read_request().await? {
@@ -2029,6 +2249,52 @@ impl Agent {
 
                 ActionType::AskAgent { to, message } => {
                     results.push(self.ask_agent(task, to, message).await);
+                }
+
+                ActionType::Decide {
+                    id,
+                    allow,
+                    answer,
+                    why,
+                } => {
+                    let named = id.trim();
+                    let reply = if answer.trim().is_empty() {
+                        crate::core::asking::Reply::Allowed(*allow)
+                    } else {
+                        crate::core::asking::Reply::Said(answer.trim().to_string())
+                    };
+
+                    // A parent settling this for the user must have actually asked
+                    // them. It has a keyboard; a detached one does not, and passing
+                    // the question further up is what Decide is for.
+                    let text = match self.decide(named, reply).await {
+                        Some(said) => format!(
+                            "[DECIDED] #{} — {} {}. The agent was waiting on this and is moving \
+                             again.{}",
+                            named,
+                            if answer.trim().is_empty() {
+                                if *allow { "allowed" } else { "refused" }
+                            } else {
+                                "answered"
+                            },
+                            said,
+                            if why.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" You said: {}", why.trim())
+                            }
+                        ),
+                        None => format!(
+                            "[DECIDE ERROR] #{} could not be settled that way — it was already \
+                             answered, it ran out of patience, or you gave a verdict where words \
+                             were wanted (or the other way round). Waiting now:\n{}",
+                            named,
+                            crate::core::asking::as_text(&self.outstanding().await)
+                        ),
+                    };
+
+                    ui.show_status(&first_line(&text)).await?;
+                    results.push(text);
                 }
 
                 ActionType::RequestGrant {
@@ -2927,7 +3193,17 @@ fn stage_actions(stage: &planner::Stage) -> Vec<&ActionType> {
     }
 }
 
+/// Whether there is anybody who could answer a question from this task. A
+/// background job runs when nobody is at the keyboard; a spawned copy runs
+/// detached, on an interface with nobody behind it.
+fn nobody_to_ask(task: &TaskObject) -> bool {
+    task.grant.is_some() || task.depth > 0
+}
+
 fn refuse_outside_grant(task: &TaskObject, action: &ActionType) -> Option<String> {
+    // Questions and requests for permission are not refused here. They go up to
+    // whoever started this and to the person at the terminal, and the agent waits
+    // — see `ask_upward`. What is refused here is reaching past a grant.
     let grant = task.grant.as_ref()?;
 
     match action {
@@ -2947,18 +3223,6 @@ fn refuse_outside_grant(task: &TaskObject, action: &ActionType) -> Option<String
              built here. Report what is missing instead.",
             module_name
         )),
-
-        ActionType::PermissionRequest { action, .. } => Some(format!(
-            "[NO ONE TO ASK] this job runs in the background and cannot ask about '{}'. \
-             What a job may do is fixed when it is created.",
-            action
-        )),
-
-        ActionType::PromptToUser { .. } => Some(
-            "[NO ONE TO ASK] this job runs in the background with nobody at the prompt. \
-             Finish with what you already know, or report what you needed to ask."
-                .to_string(),
-        ),
 
         _ => None,
     }
@@ -3047,23 +3311,32 @@ fn join_reports(existing: Option<String>, delivered: Vec<String>) -> String {
     }
 }
 
-fn child_report(
-    errand: &str,
-    took: std::time::Duration,
-    outcome: &JumabekResult<String>,
-) -> String {
+fn child_report(errand: &str, took: std::time::Duration, outcome: &JumabekResult<Ended>) -> String {
+    let seconds = took.as_secs_f64();
+
     match outcome {
-        Ok(summary) => format!(
+        Ok(ended) if ended.finished => format!(
             "the agent you spawned for '{}' finished in {:.0}s and reported: {}",
             errand,
-            took.as_secs_f64(),
-            summary.trim()
+            seconds,
+            ended.text.trim()
         ),
-        Err(e) => format!(
-            "the agent you spawned for '{}' died after {:.0}s without finishing: {}",
+
+        // It ran, it stopped early, and it said why. That is not a crash and the
+        // parent should read the reason rather than assume the work is done.
+        Ok(ended) => format!(
+            "the agent you spawned for '{}' gave up after {:.0}s and did NOT finish. It said: \
+             {}. Decide whether to do the rest yourself, spawn another one with what it was \
+             missing, or tell the user what is blocked.",
             errand,
-            took.as_secs_f64(),
-            e
+            seconds,
+            ended.text.trim()
+        ),
+
+        Err(e) => format!(
+            "the agent you spawned for '{}' died after {:.0}s without finishing: {}. Nothing it \
+             was doing was saved. This is a fault on our side, not something it did wrong.",
+            errand, seconds, e
         ),
     }
 }
@@ -3118,6 +3391,30 @@ fn decide_grant(
         (true, true) => Verdict::PutToTheUser,
         (true, false) => Verdict::SentUpward,
         (false, _) => Verdict::GrantedByMainAgent,
+    }
+}
+
+/// How a run ended, so whoever spawned it can tell an answer from a surrender.
+/// Both come back as text; only one of them means the work was done.
+#[derive(Debug, Clone)]
+pub struct Ended {
+    pub text: String,
+    pub finished: bool,
+}
+
+impl Ended {
+    fn done(text: String) -> Ended {
+        Ended {
+            text,
+            finished: true,
+        }
+    }
+
+    fn stopped(text: String) -> Ended {
+        Ended {
+            text,
+            finished: false,
+        }
     }
 }
 
@@ -3211,7 +3508,9 @@ mod subagent_tests {
         let report = child_report(
             "count the log files",
             took(),
-            &Ok("  there are 41, of which 3 are empty  ".to_string()),
+            &Ok(Ended::done(
+                "  there are 41, of which 3 are empty  ".to_string(),
+            )),
         );
 
         assert!(report.contains("count the log files"), "{report}");
@@ -3220,6 +3519,40 @@ mod subagent_tests {
             "{report}"
         );
         assert!(report.contains("3s"), "{report}");
+        assert!(report.contains("finished"), "{report}");
+    }
+
+    #[test]
+    fn a_child_that_gave_up_is_not_reported_as_having_finished() {
+        let report = child_report(
+            "count the log files",
+            took(),
+            &Ok(Ended::stopped(
+                "[NO ONE TO ASK] you are a copy working on your own".to_string(),
+            )),
+        );
+
+        assert!(report.contains("did NOT finish"), "{report}");
+        assert!(report.contains("NO ONE TO ASK"), "{report}");
+        assert!(
+            !report.contains("died"),
+            "giving up was dressed up as a crash: {report}"
+        );
+    }
+
+    #[test]
+    fn the_three_ways_a_child_can_end_read_differently() {
+        let finished = child_report("x", took(), &Ok(Ended::done("done".to_string())));
+        let gave_up = child_report("x", took(), &Ok(Ended::stopped("blocked".to_string())));
+        let died = child_report(
+            "x",
+            took(),
+            &Err(JumabekError::InternalError("boom".to_string())),
+        );
+
+        for (a, b) in [(&finished, &gave_up), (&gave_up, &died), (&finished, &died)] {
+            assert_ne!(a, b, "two different endings read the same");
+        }
     }
 
     #[test]
@@ -3232,7 +3565,7 @@ mod subagent_tests {
             )),
         );
 
-        assert!(report.contains("without finishing"), "{report}");
+        assert!(report.contains("died"), "{report}");
         assert!(report.contains("the skill went away"), "{report}");
         assert!(
             !report.contains("reported:"),
@@ -3551,6 +3884,110 @@ mod subagent_tests {
             discussion_key("g2", "alice", "bob"),
             "two groups shared one discussion budget"
         );
+    }
+
+    fn detached(depth: u32, grant: Option<Grant>) -> TaskObject {
+        let mut task = task_with(grant);
+        task.depth = depth;
+        task
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_comes_in_time_is_taken_without_a_reminder() {
+        use crate::core::asking::Reply;
+
+        let waiting = crate::core::asking::Waiting::new();
+        let rx = waiting
+            .open(crate::core::asking::Wanted {
+                id: "1".to_string(),
+                asked_by: "a".to_string(),
+                role: None,
+                ask: crate::core::asking::Ask::Question {
+                    message: "which?".to_string(),
+                    options: Vec::new(),
+                },
+            })
+            .await;
+
+        waiting
+            .answer("1", Reply::Said("that one".to_string()))
+            .await;
+
+        assert_eq!(rx.await.unwrap(), Reply::Said("that one".to_string()));
+    }
+
+    #[test]
+    fn the_reminder_lands_before_the_request_dies_rather_than_after() {
+        assert!(
+            REMIND_BEFORE_GIVING_UP < std::time::Duration::from_secs(300),
+            "the reminder would fire after the shortest sensible patience had already run out"
+        );
+        assert!(
+            REMIND_BEFORE_GIVING_UP >= std::time::Duration::from_secs(30),
+            "a reminder that lands seconds before the end is no use to somebody who stepped away"
+        );
+    }
+
+    #[test]
+    fn something_that_wants_an_answer_rings_the_terminal() {
+        assert_eq!(
+            BELL, "\x07",
+            "the bell is what reaches somebody not looking"
+        );
+    }
+
+    #[test]
+    fn a_copy_asking_permission_is_never_turned_away_at_the_door() {
+        let asking = ActionType::PermissionRequest {
+            action: "delete the old build".to_string(),
+            description: String::new(),
+            risk_level: "medium".to_string(),
+        };
+
+        // Not a refusal: it goes up to whoever spawned it and to the person at
+        // the terminal, and the copy waits for one of them.
+        for task in [detached(1, None), detached(0, Some(Grant::default()))] {
+            assert!(
+                refuse_outside_grant(&task, &asking).is_none(),
+                "a request for permission was refused instead of being passed up"
+            );
+        }
+    }
+
+    #[test]
+    fn the_person_at_the_terminal_is_still_asked() {
+        let asking = ActionType::PermissionRequest {
+            action: "delete the old build".to_string(),
+            description: String::new(),
+            risk_level: "medium".to_string(),
+        };
+
+        assert!(
+            refuse_outside_grant(&detached(0, None), &asking).is_none(),
+            "a question meant for the user in front of the terminal was swallowed"
+        );
+    }
+
+    #[test]
+    fn a_copy_asking_a_question_is_not_turned_away_at_the_door_either() {
+        let asking = ActionType::PromptToUser {
+            message: "which folder did you mean?".to_string(),
+            options: Vec::new(),
+        };
+
+        for task in [detached(2, None), detached(0, Some(Grant::default()))] {
+            assert!(
+                refuse_outside_grant(&task, &asking).is_none(),
+                "a question was refused instead of being put to somebody"
+            );
+        }
+    }
+
+    #[test]
+    fn nobody_is_there_for_a_job_or_a_copy_but_is_for_the_user() {
+        assert!(nobody_to_ask(&detached(0, Some(Grant::default()))));
+        assert!(nobody_to_ask(&detached(1, None)));
+        assert!(!nobody_to_ask(&detached(0, None)));
     }
 
     #[test]

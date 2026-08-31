@@ -31,6 +31,11 @@ use voice::Voice;
 enum Command {
     Task(String),
     Switch(Mode),
+    Decide {
+        id: String,
+        reply: core::asking::Reply,
+    },
+    Waiting,
     Quit,
     Unknown(String),
 }
@@ -223,19 +228,57 @@ async fn main() -> JumabekResult<()> {
                 }
             },
 
+            Command::Waiting => {
+                let open = agent.outstanding().await;
+                ui.show_response(&format!(
+                    "{}\n\n`/allow <id>` · `/deny <id>` · `/answer <id> <what you want to say>`",
+                    core::asking::as_text(&open)
+                ))
+                .await?;
+            }
+
+            Command::Decide { id, reply } => {
+                let what = match &reply {
+                    core::asking::Reply::Allowed(true) => "allowed".to_string(),
+                    core::asking::Reply::Allowed(false) => "refused".to_string(),
+                    core::asking::Reply::Said(said) => format!("answered '{}' to", said),
+                };
+
+                match agent.decide(&id, reply).await {
+                    Some(said) => ui.show_status(&format!("{} {}", what, said)).await?,
+                    None => {
+                        ui.show_error(&format!(
+                            "'{}' could not be settled that way — already answered, out of \
+                             patience, or a verdict where words were wanted. Waiting now:\n{}",
+                            id,
+                            core::asking::as_text(&agent.outstanding().await)
+                        ))
+                        .await?
+                    }
+                }
+            }
+
             Command::Unknown(name) => {
                 ui.show_error(&format!(
-                    "unknown command '{}'. try /mode cli, /mode voice, /quit",
+                    "unknown command '{}'. try /mode cli, /mode voice, /allow <id>, \
+                     /deny <id>, /waiting, /quit",
                     name
                 ))
                 .await?;
             }
 
             Command::Task(task) => {
+                // Nothing from a job, an agent working on its own or the inbox
+                // may land in the middle of the answer being written. It waits
+                // and comes out afterwards, in the order it was said.
+                notifier.hold();
+
                 let outcome = tokio::select! {
                     result = agent.handle(ui.as_mut(), task) => Some(result),
                     _ = tokio::signal::ctrl_c() => None,
                 };
+
+                notifier.release();
 
                 match outcome {
                     Some(Ok(())) => {}
@@ -677,6 +720,32 @@ fn parse_command(input: &str) -> Command {
 
     match name.as_str() {
         "quit" | "exit" | "q" => Command::Quit,
+        "allow" | "deny" | "answer" if argument.is_empty() => Command::Waiting,
+        "allow" => Command::Decide {
+            id: argument.to_string(),
+            reply: core::asking::Reply::Allowed(true),
+        },
+        "deny" | "refuse" => Command::Decide {
+            id: argument.to_string(),
+            reply: core::asking::Reply::Allowed(false),
+        },
+        "answer" => {
+            let said = rest
+                .split_whitespace()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if said.is_empty() {
+                Command::Unknown("answer needs the answer after the id".to_string())
+            } else {
+                Command::Decide {
+                    id: argument.to_string(),
+                    reply: core::asking::Reply::Said(said),
+                }
+            }
+        }
+        "waiting" | "asks" => Command::Waiting,
         "mode" => match Mode::parse(argument) {
             Some(mode) => Command::Switch(mode),
             None => Command::Unknown(format!("mode {}", argument)),
